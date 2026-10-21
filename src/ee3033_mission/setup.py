@@ -27,6 +27,8 @@ setup(
             'target_localizer = ee3033_mission.target_localizer:main',
             'mission_manager = ee3033_mission.mission_manager:main',
             'cmd_vel_watchdog = ee3033_mission.cmd_vel_watchdog:main',
+            'setup_check = ee3033_mission.setup_check:main',
+            'camera_lidar_check = ee3033_mission.camera_lidar_check:main',
         ],
     },
 )

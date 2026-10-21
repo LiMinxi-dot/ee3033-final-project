@@ -13,7 +13,13 @@ It uses the vendor packages on the car (`balance_robot_base`, `lslidar_driver_n1
 | `target_localizer` | detections, `/scan_fixed`, `/camera_info`, TF | `/target/estimate` (`ee3033_interfaces/TargetEstimate`), `/target/markers` |
 | `mission_manager` | `/map`, `/target/estimate`, TF, Nav2 actions `navigate_to_pose` and `spin` | `/initialpose`, `/mission/state`, `/mission/target` (`PointStamped`), `/mission/viewpoints`, result YAML |
 
+| `cmd_vel_watchdog` | `/cmd_vel_teleop` | `/cmd_vel` (speed-limited; stop 0.6 s after the last command) |
+
 Services: `/mission/start`, `/mission/stop` (`std_srvs/Trigger`), `/target_localizer/reset` (`std_srvs/Empty`).
+
+Tools:
+- `ros2 run ee3033_mission setup_check [--computer]`: checks the course packages, devices, YOLO and network settings.
+- `ros2 run ee3033_mission camera_lidar_check`: measures `camera_offset_yaw_deg` from camera vs LiDAR bearings of one object and saves an overlay image.
 All tunable values are in `config/mission.yaml`.
 
 ## Target localization

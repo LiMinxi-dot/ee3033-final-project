@@ -7,6 +7,7 @@ classes as ee3033_interfaces/TargetDetectionArray. An annotated JPEG is
 published at a low rate for viewing in rqt/rviz from the VM.
 """
 
+import os
 import time
 
 import cv2
@@ -57,8 +58,8 @@ class TargetDetector(Node):
         self.debug_period = 1.0 / max(0.1, float(p('debug_rate')))
         self.last_debug = 0.0
 
+        model_path = self.ensure_model(p('model_path'))
         from ultralytics import YOLO  # heavy import, keep it after the parameters are logged
-        model_path = p('model_path')
         self.get_logger().info(f'Loading YOLO model {model_path} (imgsz={self.imgsz})')
         self.model = YOLO(model_path, task='detect')
         names = self.model.names  # {id: name}
@@ -83,6 +84,34 @@ class TargetDetector(Node):
         self.n_frames = 0
         self.t_infer = 0.0
         self.create_timer(10.0, self.report_rate)
+
+    def ensure_model(self, model_path):
+        """Return a usable model path; download an official Ultralytics model if it is missing.
+
+        Ultralytics downloads known model names (yolov8n.pt, yolo11n.pt, ...) into the current
+        directory, so the download runs inside the model's target folder.
+        """
+        if os.path.exists(model_path):
+            return model_path
+        folder, name = os.path.split(os.path.abspath(model_path))
+        self.get_logger().warn(f'{model_path} not found; downloading {name} (needs internet on the car)')
+        try:
+            os.makedirs(folder, exist_ok=True)
+            cwd = os.getcwd()
+            os.chdir(folder)
+            try:
+                from ultralytics import YOLO
+                YOLO(name)
+            finally:
+                os.chdir(cwd)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f'Cannot load or download the YOLO model {model_path}: {e}. Copy {name} there by hand, '
+                'e.g. scp yolov8n.pt to the car.') from e
+        if not os.path.exists(model_path):
+            raise RuntimeError(f'Download did not produce {model_path}')
+        self.get_logger().info(f'Downloaded {model_path}')
+        return model_path
 
     def on_image(self, msg):
         now = time.time()
