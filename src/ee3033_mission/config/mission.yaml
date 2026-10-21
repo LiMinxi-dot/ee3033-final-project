@@ -8,7 +8,9 @@ target_detector:
     image_topic: /camera/image_raw
     use_compressed: false          # true when running off-board on /camera/image_raw/compressed
     camera_frame: camera_link      # TF frame of the camera (x forward, y left)
-    target_classes: ["bottle"]     # COCO class names; set once the target object is known
+    target_classes: ["bottle"]     # COCO class names (bottle, cup, sports ball, backpack, ...);
+                                   # set to the demo target. It must reach the LiDAR plane (~19 cm)
+                                   # and not be transparent/shiny, or set target_height below.
     conf_threshold: 0.45
     imgsz: 320                     # 320: ~9 FPS on the Pi 5 (PyTorch); 640: ~3 FPS
     max_rate: 10.0
@@ -30,14 +32,15 @@ target_localizer:
     scan_topic: /scan_fixed
     camera_info_topic: /camera_info
     hfov_deg: 62.0                 # used until the camera is calibrated (camera_info K)
-    # Measured camera mount relative to the vendor TF camera_link (x fwd, y left, yaw CCW).
-    # balance4 (2026-10-21): camera about 1-2 cm left of the centre line (measured by hand).
-    # Yaw from camera vs LiDAR bearings of a desk leg (cam -4.5 deg, LiDAR +4.8 deg at 0.98 m) and a
-    # shaker (cam -27.2 deg, LiDAR -18.8 deg at 1.0 m): both give about +8.3 deg (camera aims left).
-    # Height (28-29 cm vs 26.55 cm in TF) does not matter: localization is planar.
+    # ---- PER-CAR CALIBRATION: re-measure on every car (README: "Calibrate the camera") ----
+    # Camera mount relative to the course TF frame camera_link (x forward, y left, yaw CCW).
+    # x/y: measure by hand. yaw: ros2 run ee3033_mission camera_lidar_check
+    # Values below: car balance4, 2026-10-21 (camera 1-2 cm left of the centre line, optical
+    # axis about 8 deg to the left). Height does not matter: localization is planar.
     camera_offset_x: 0.0
     camera_offset_y: 0.015
     camera_offset_yaw_deg: 8.3
+    # -----------------------------------------------------------------------------------------
     use_camera_info: true
     min_score: 0.5
     min_range: 0.15

@@ -58,6 +58,29 @@ def ray_range_from_scan(origin_xy, ray_yaw, points_xy, half_width_rad,
     return float(np.median(near)), int(near.size)
 
 
+def nearest_cluster_bearing(origin_xy, ray_yaw, points_xy, half_width_rad,
+                            min_range=0.3, max_range=3.0, cluster_depth=0.15):
+    """Bearing and range of the nearest LiDAR cluster within half_width_rad of a ray.
+
+    Used for camera/LiDAR yaw calibration: the camera gives ray_yaw, the LiDAR
+    tells where the object really is. Returns (bearing, range, n_points) with the
+    bearing in the same frame as ray_yaw, or (None, None, 0).
+    """
+    pts = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    if pts.size == 0:
+        return None, None, 0
+    d = pts - np.asarray(origin_xy, dtype=float)
+    r = np.hypot(d[:, 0], d[:, 1])
+    ang = np.arctan2(d[:, 1], d[:, 0])
+    rel = wrap_angle(ang - ray_yaw)
+    keep = (np.abs(rel) <= half_width_rad) & (r >= min_range) & (r <= max_range)
+    if not keep.any():
+        return None, None, 0
+    r, rel = r[keep], rel[keep]
+    near = r <= r.min() + cluster_depth
+    return float(ray_yaw + np.median(rel[near])), float(np.median(r[near])), int(near.sum())
+
+
 def range_from_object_height(bbox_height_px, object_height_m, fy):
     """Monocular range estimate from a known object height (fallback when the LiDAR misses)."""
     if bbox_height_px <= 1.0 or object_height_m <= 0.0:

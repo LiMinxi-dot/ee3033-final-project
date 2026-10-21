@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from ee3033_mission.geometry import (apply_body_offset, focal_length_px, fuse_observations, generate_viewpoints,
-                                     order_nearest_neighbour, pixel_to_bearing, range_from_object_height,
+                                     nearest_cluster_bearing, order_nearest_neighbour, pixel_to_bearing,
+                                     range_from_object_height,
                                      ray_range_from_scan, wrap_angle, yaw_from_quaternion)
 
 
@@ -45,6 +46,17 @@ def test_ray_range_picks_nearest_object_on_ray():
 def test_ray_range_none_when_nothing_on_ray():
     r, n = ray_range_from_scan((0, 0), math.pi / 2, [(2.0, 0.0)], math.radians(3))
     assert r is None and n == 0
+
+
+def test_nearest_cluster_bearing_finds_object_off_the_ray():
+    # object at +8 deg, 1.2 m; the camera ray says 0 deg; wall at 3 m
+    obj_ang = math.radians(8)
+    obj = [(1.2 * math.cos(obj_ang + e), 1.2 * math.sin(obj_ang + e)) for e in (-0.02, 0.0, 0.02)]
+    wall = [(3.0, y) for y in np.linspace(-1, 1, 41)]
+    b, r, n = nearest_cluster_bearing((0, 0), 0.0, obj + wall, math.radians(15))
+    assert math.degrees(b) == pytest.approx(8.0, abs=0.5)
+    assert r == pytest.approx(1.2, abs=0.02)
+    assert n == 3
 
 
 def test_range_from_object_height():
