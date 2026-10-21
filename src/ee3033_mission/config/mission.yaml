@@ -32,15 +32,14 @@ target_localizer:
     scan_topic: /scan_fixed
     camera_info_topic: /camera_info
     hfov_deg: 62.0                 # used until the camera is calibrated (camera_info K)
-    # ---- PER-CAR CALIBRATION: re-measure on every car (README: "Calibrate the camera") ----
-    # Camera mount relative to the course TF frame camera_link (x forward, y left, yaw CCW).
-    # x/y: measure by hand. yaw: ros2 run ee3033_mission camera_lidar_check
-    # Values below: car balance4, 2026-10-21 (camera 1-2 cm left of the centre line, optical
-    # axis about 8 deg to the left). Height does not matter: localization is planar.
+    # Camera mount calibration of our car (balance4), measured 2026-10-21, relative to the course
+    # TF frame camera_link (x forward, y left, yaw CCW): camera 1-2 cm left of the centre line,
+    # optical axis about 8 deg to the left. Height does not matter: localization is planar.
+    # Re-measure only if the camera is moved: x/y by hand, yaw with
+    #   ros2 run ee3033_mission camera_lidar_check
     camera_offset_x: 0.0
     camera_offset_y: 0.015
     camera_offset_yaw_deg: 8.3
-    # -----------------------------------------------------------------------------------------
     use_camera_info: true
     min_score: 0.5
     min_range: 0.15

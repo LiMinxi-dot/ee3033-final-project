@@ -65,10 +65,11 @@ first start if the car has internet; otherwise copy `yolov8n.pt` there by hand.
 On the computer, `ros2 run ee3033_mission setup_check --computer` checks the PC side (clone and
 build the repo there too if you want the RViz config and to echo `/target/estimate`).
 
-### 3. Calibrate the camera (once per car)
+### 3. Camera calibration (already done for our car)
 
-The localizer needs the camera mount offset relative to the course TF frame `camera_link`. The
-values in `config/mission.yaml` are for our car (balance4) and **must be re-measured on another car**.
+`config/mission.yaml` contains the camera mount calibration of our car (balance4): 1.5 cm left of
+the centre line, optical axis 8.3° to the left of the course TF frame `camera_link`. Nothing needs
+to be done unless the camera is moved or remounted. Then:
 
 1. Measure by hand how far the camera is left (+) / right (−) of the centre line and put it in `camera_offset_y`.
 2. Stand the car upright and start the sensors and the detector:
@@ -84,8 +85,8 @@ values in `config/mission.yaml` are for our car (balance4) and **must be re-meas
 4. Put the suggested value in `camera_offset_yaw_deg` and check `/tmp/camera_lidar_check.png`: in the right
    panel the LiDAR points should sit on the objects.
 
-Also check the turning direction once: in teleop, `j` must turn the car **left**. If it turns right,
-the base's angular sign is inverted and Nav2 will not work.
+Before the first mission, check the turning direction once: in teleop, `j` must turn the car
+**left**. If it turns right, the base's angular sign is inverted and Nav2 will not work.
 
 ### 4. Run the demo
 
