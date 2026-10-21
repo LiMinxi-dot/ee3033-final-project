@@ -1,0 +1,73 @@
+# Tunable parameters for the EE3033 target search mission.
+# Launch files load this file; override a value on the command line with
+#   ros2 launch ee3033_mission mission.launch.py params_file:=/path/to/other.yaml
+
+target_detector:
+  ros__parameters:
+    model_path: /home/ros2_ws/models/yolov8n.pt   # .pt (PyTorch) or *_ncnn_model folder
+    image_topic: /camera/image_raw
+    use_compressed: false          # true when running off-board on /camera/image_raw/compressed
+    camera_frame: camera_link      # TF frame of the camera (x forward, y left)
+    target_classes: ["bottle"]     # COCO class names; set once the target object is known
+    conf_threshold: 0.45
+    imgsz: 320                     # 320: ~9 FPS on the Pi 5 (PyTorch); 640: ~3 FPS
+    max_rate: 10.0
+    debug_image: true              # annotated JPEG on /target_detector/debug_image/compressed
+    debug_rate: 2.0
+
+cmd_vel_watchdog:
+  ros__parameters:
+    input_topic: /cmd_vel_teleop   # teleop on the VM publishes here
+    output_topic: /cmd_vel
+    timeout: 0.6                   # s without a command -> stop (the base itself has no timeout);
+                                   # > the ~0.5 s key-repeat delay of teleop_twist_keyboard
+    max_linear: 0.25
+    max_angular: 1.2
+
+target_localizer:
+  ros__parameters:
+    global_frame: map
+    scan_topic: /scan_fixed
+    camera_info_topic: /camera_info
+    hfov_deg: 62.0                 # used until the camera is calibrated (camera_info K)
+    # Measured camera mount relative to the vendor TF camera_link (x fwd, y left, yaw CCW).
+    # balance4 (2026-10-21): camera about 1-2 cm left of the centre line (measured by hand).
+    # Yaw from camera vs LiDAR bearings of a desk leg (cam -4.5 deg, LiDAR +4.8 deg at 0.98 m) and a
+    # shaker (cam -27.2 deg, LiDAR -18.8 deg at 1.0 m): both give about +8.3 deg (camera aims left).
+    # Height (28-29 cm vs 26.55 cm in TF) does not matter: localization is planar.
+    camera_offset_x: 0.0
+    camera_offset_y: 0.015
+    camera_offset_yaw_deg: 8.3
+    use_camera_info: true
+    min_score: 0.5
+    min_range: 0.15
+    max_range: 4.0                 # ignore detections further than this (m)
+    ray_half_width_deg: 2.0        # minimum LiDAR search half-width around the target bearing
+    cluster_depth: 0.15
+    target_radius: 0.04            # LiDAR hits the surface; add the object radius (m)
+    target_height: 0.0             # > 0: monocular range fallback from the box height (m)
+    max_scan_age: 0.25
+    cluster_radius: 0.30           # observations within this distance are fused
+    min_observations: 4            # needed to confirm the target
+    max_spread: 0.20
+
+mission_manager:
+  ros__parameters:
+    global_frame: map
+    robot_frame: base_footprint
+    auto_start: false              # false: start with ros2 service call /mission/start std_srvs/srv/Trigger
+    set_initial_pose: true
+    initial_pose: [0.0, 0.0, 0.0]  # mapping starts at the start position, so it is the map origin
+    localize_wait: 2.0
+    initial_spin: true
+    spin_angle_deg: 360.0
+    viewpoint_spacing: 1.0         # m between search viewpoints
+    min_clearance: 0.25            # m from walls/unknown space (robot radius 0.12, Nav2 inflation 0.20)
+    skip_radius: 0.6               # no viewpoints this close to the start (covered by the first spin)
+    max_viewpoints: 40
+    nav_timeout: 60.0
+    spin_timeout: 25.0
+    home_tolerance: 0.25
+    home_retries: 2
+    report_unconfirmed: true       # report the best guess if the target was never confirmed
+    result_file: /home/ros2_ws/mission_result.yaml
