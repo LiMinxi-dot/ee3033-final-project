@@ -54,9 +54,9 @@ class MissionManager(Node):
         self.declare_parameter('localize_wait', 2.0)              # s after publishing the initial pose
         self.declare_parameter('initial_spin', True)
         self.declare_parameter('spin_angle_deg', 360.0)
-        self.declare_parameter('viewpoint_spacing', 1.0)
-        self.declare_parameter('min_clearance', 0.25)
-        self.declare_parameter('skip_radius', 0.6)
+        self.declare_parameter('viewpoint_spacing', 0.6)
+        self.declare_parameter('min_clearance', 0.20)
+        self.declare_parameter('skip_radius', 0.4)
         self.declare_parameter('max_viewpoints', 40)
         self.declare_parameter('nav_timeout', 60.0)
         self.declare_parameter('spin_timeout', 25.0)
