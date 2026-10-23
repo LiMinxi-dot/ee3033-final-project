@@ -63,9 +63,9 @@ mission_manager:
     localize_wait: 2.0
     initial_spin: true
     spin_angle_deg: 360.0
-    viewpoint_spacing: 1.0         # m between search viewpoints
-    min_clearance: 0.25            # m from walls/unknown space (robot radius 0.12, Nav2 inflation 0.20)
-    skip_radius: 0.6               # no viewpoints this close to the start (covered by the first spin)
+    viewpoint_spacing: 0.6         # m between search viewpoints (1.0 gave a single viewpoint in the 2.5 m sandbox)
+    min_clearance: 0.20            # m from walls/unknown space (robot radius 0.12, Nav2 inflation 0.20)
+    skip_radius: 0.4               # no viewpoints this close to the start (covered by the first spin)
     max_viewpoints: 40
     nav_timeout: 60.0
     spin_timeout: 25.0
