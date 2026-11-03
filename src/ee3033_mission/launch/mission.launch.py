@@ -11,7 +11,9 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, TimerAction
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, RegisterEventHandler,
+                            TimerAction)
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -29,6 +31,12 @@ def generate_launch_description():
     manager = Node(package='ee3033_mission', executable='mission_manager', output='screen',
                    parameters=[params, {'auto_start': LaunchConfiguration('auto_start')}])
 
+    wait_tf = Node(package='ee3033_mission', executable='wait_for_transform', output='screen',
+                   parameters=[{'target_frame': 'map', 'source_frame': 'base_footprint'}])
+    after_amcl = RegisterEventHandler(OnProcessExit(target_action=wait_tf, on_exit=[
+        LogInfo(msg='[ee3033] AMCL is localized: starting Nav2'),
+        include('balance_navigation', 'balance_nav2_core.launch.py')]))
+
     return LaunchDescription([
         DeclareLaunchArgument('map', description='Map yaml saved in step 1'),
         DeclareLaunchArgument('params_file', default_value=default_params),
@@ -40,7 +48,8 @@ def generate_launch_description():
         TimerAction(period=6.0, actions=[LogInfo(msg='[ee3033] starting map server + AMCL'),
                                          include('balance_navigation', 'balance_amcl_localization.launch.py',
                                                  {'map': LaunchConfiguration('map')})]),
-        TimerAction(period=10.0, actions=[LogInfo(msg='[ee3033] starting Nav2'),
-                                          include('balance_navigation', 'balance_nav2_core.launch.py')]),
-        TimerAction(period=14.0, actions=[LogInfo(msg='[ee3033] starting mission manager'), manager]),
+        # mission_manager sets the AMCL initial pose; Nav2 starts once AMCL publishes map -> base_footprint
+        # (it aborts its bringup if that transform is missing while its costmaps activate).
+        after_amcl,
+        TimerAction(period=8.0, actions=[LogInfo(msg='[ee3033] starting mission manager'), manager, wait_tf]),
     ])

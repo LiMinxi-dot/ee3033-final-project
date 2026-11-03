@@ -26,6 +26,28 @@ cmd_vel_watchdog:
     max_linear: 0.25
     max_angular: 1.2
 
+auto_mapper:
+  ros__parameters:
+    global_frame: map
+    robot_frame: base_footprint
+    auto_start: false              # false: start with ros2 service call /explore/start std_srvs/srv/Trigger
+    robot_radius: 0.15             # m; goals and paths keep this far from walls (robot radius 0.12)
+    min_frontier_size: 0.20        # m; shorter frontiers are SLAM noise
+    goal_reach: 0.5                # m; the goal is a safe cell at most this far from the frontier
+    gain_weight: 0.3               # cost = path length - gain_weight * frontier size
+    blacklist_radius: 0.3
+    max_radius: 0.0                # m from home; > 0 ignores frontiers outside (e.g. LiDAR seeing out of the sandbox)
+    replan_period: 1.0
+    progress_timeout: 15.0         # s without getting 0.1 m closer -> blacklist the frontier
+    nav_timeout: 60.0
+    settle_timeout: 6.0            # max wait for a fresh /map after reaching a goal
+    finish_wait: 6.0               # s without any reachable frontier -> exploration done
+    max_duration: 300.0            # s, then return home anyway
+    return_home: true
+    home_retries: 2
+    home_tolerance: 0.25
+    map_file: /home/ros2_ws/maps/sandbox   # writes sandbox.pgm + sandbox.yaml
+
 target_localizer:
   ros__parameters:
     global_frame: map
@@ -50,8 +72,11 @@ target_localizer:
     target_height: 0.0             # > 0: monocular range fallback from the box height (m)
     max_scan_age: 0.25
     cluster_radius: 0.30           # observations within this distance are fused
-    min_observations: 4            # needed to confirm the target
-    max_spread: 0.20
+    min_observations: 6            # needed to confirm the target (4 with a 0.14 m spread gave a 15 cm error)
+    max_spread: 0.10
+    ignore_map_walls: true         # LiDAR hits on the walls of the saved map never give the target range
+    wall_margin: 0.08              # m from a wall cell centre that counts as "on the wall": the wall cells and
+                                   # their 8 neighbours (hits on a wall surface land in the next cell)
 
 mission_manager:
   ros__parameters:
@@ -60,12 +85,25 @@ mission_manager:
     auto_start: false              # false: start with ros2 service call /mission/start std_srvs/srv/Trigger
     set_initial_pose: true
     initial_pose: [0.0, 0.0, 0.0]  # mapping starts at the start position, so it is the map origin
-    localize_wait: 2.0
+    initial_xy_std: 0.10           # m; AMCL initial pose uncertainty
+    initial_yaw_std_deg: 20.0      # deg; wide enough for AMCL to correct a robot placed a bit askew
+    localize_wait: 2.0             # s of AMCL no-motion updates before the localization check
+    localization_check: true       # the LiDAR scan must fit the map walls before the robot moves (see the log
+                                   # lines starting with [loc]); checked again at every viewpoint (warning only)
+    min_scan_match: 0.75           # fraction of LiDAR points that must lie on the map walls
+                                   # (home arena: 87-99 % when localized, 11-48 % when 56-65 deg off)
+    scan_match_margin: 0.10        # also fail if a nearby pose fits better by this much: in a small arena
+                                   # 60 % of the points still land near a wall when the robot is 20-40 deg off
+    scan_topic: /scan_fixed
+    scan_min_range: 0.075          # m; closer LiDAR hits are the robot itself (4-5 cm behind the LiDAR); the same
+                                   # limit is set for SLAM in mapping.launch.py (min_laser_range)
     initial_spin: true
     spin_angle_deg: 360.0
-    viewpoint_spacing: 0.6         # m between search viewpoints (1.0 gave a single viewpoint in the 2.5 m sandbox)
+    view_range: 1.5                # m; the planner places viewpoints (the number is up to it) so that every free
+                                   # cell is within this distance and in line of sight of one of them
+                                   # (YOLO imgsz 320 finds the target reliably up to about this distance)
+    candidate_spacing: 0.25        # m; grid of candidate viewpoints
     min_clearance: 0.20            # m from walls/unknown space (robot radius 0.12, Nav2 inflation 0.20)
-    skip_radius: 0.4               # no viewpoints this close to the start (covered by the first spin)
     max_viewpoints: 40
     nav_timeout: 60.0
     spin_timeout: 25.0

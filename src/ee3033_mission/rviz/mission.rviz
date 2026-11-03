@@ -55,6 +55,11 @@ Visualization Manager:
         Value: /mission/viewpoints
         Durability Policy: Transient Local
     - Class: rviz_default_plugins/MarkerArray
+      Name: Frontiers
+      Enabled: true
+      Topic:
+        Value: /explore/frontiers
+    - Class: rviz_default_plugins/MarkerArray
       Name: Target
       Enabled: true
       Topic:
