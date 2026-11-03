@@ -6,9 +6,11 @@ For each detection:
      configured horizontal field of view).
   2. TF at the image time gives the camera pose in the map, so the bearing
      becomes a ray in the map.
-  3. The LiDAR scan closest in time is transformed into the map; the nearest
-     hits around the ray give the range. If the LiDAR sees nothing there, an
-     optional known object height gives a monocular range instead.
+  3. The LiDAR scan closest in time is transformed into the map. Hits on the
+     walls of the saved /map are dropped (the target is never part of the map,
+     so a beam passing above or beside it must not give its range); the nearest
+     remaining hits around the ray give the range. If the LiDAR sees nothing
+     there, an optional known object height gives a monocular range instead.
   4. Range + target radius along the ray gives one observation.
 All observations are fused robustly (largest consistent cluster, median) and
 published as ee3033_interfaces/TargetEstimate plus RViz markers.
@@ -20,7 +22,9 @@ from collections import deque
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Point
+from nav_msgs.msg import OccupancyGrid
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
@@ -31,13 +35,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from ee3033_interfaces.msg import TargetDetectionArray, TargetEstimate
 
-from .geometry import (apply_body_offset, focal_length_px, fuse_observations, pixel_to_bearing,
-                       range_from_object_height, ray_range_from_scan, yaw_from_quaternion)
-
-
-def transform_to_xyyaw(tf):
-    t, q = tf.transform.translation, tf.transform.rotation
-    return t.x, t.y, yaw_from_quaternion(q.x, q.y, q.z, q.w)
+from .geometry import (apply_body_offset, fuse_observations, intrinsics, pixel_to_bearing, range_from_object_height,
+                       ray_range_from_scan, scan_to_points, transform_to_xyyaw)
+from .ros_helpers import LATCHED, marker
+from .scan_match import distances, wall_distance
 
 
 class TargetLocalizer(Node):
@@ -65,6 +66,8 @@ class TargetLocalizer(Node):
         self.declare_parameter('cluster_radius', 0.30)
         self.declare_parameter('min_observations', 4)
         self.declare_parameter('max_spread', 0.20)
+        self.declare_parameter('ignore_map_walls', True)  # drop LiDAR hits on the walls of the saved /map
+        self.declare_parameter('wall_margin', 0.08)       # m from a wall cell centre that counts as "on the wall"
 
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.frame = p('global_frame')
@@ -82,17 +85,23 @@ class TargetLocalizer(Node):
         self.cluster_radius = float(p('cluster_radius'))
         self.min_obs = int(p('min_observations'))
         self.max_spread = float(p('max_spread'))
+        self.ignore_walls, self.wall_margin = bool(p('ignore_map_walls')), float(p('wall_margin'))
+        self.walls = None             # (distance to the nearest wall per cell, resolution, origin) of /map
 
         self.K = None
         self.scans = deque(maxlen=20)
-        self.observations = []   # (x, y, class_name, source)
+        self.observations = deque(maxlen=500)   # (x, y, class_name, source); fusion is O(n^2)
         self.confirmed_logged = False
 
+        # TF at the image time may arrive a little after the detection, so lookup() waits for it.
+        # That only works because main() uses a multi-threaded executor: the listener's /tf callbacks
+        # (in their own reentrant group) keep running while on_detections waits.
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.create_subscription(LaserScan, p('scan_topic'), self.scans.append, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, p('camera_info_topic'), self.on_camera_info, 10)
+        self.create_subscription(OccupancyGrid, '/map', self.on_map, LATCHED)
         self.create_subscription(TargetDetectionArray, '/target_detector/detections', self.on_detections, 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_est = self.create_publisher(TargetEstimate, '/target/estimate', latched)
@@ -107,6 +116,18 @@ class TargetLocalizer(Node):
             if self.K is None:
                 self.get_logger().info(f'Using calibrated intrinsics fx={k[0, 0]:.1f} cx={k[0, 2]:.1f}')
             self.K = k
+
+    def on_map(self, msg):
+        grid = np.array(msg.data, dtype=np.int16).reshape(msg.info.height, msg.info.width)
+        self.walls = (wall_distance(grid, msg.info.resolution), msg.info.resolution,
+                      (msg.info.origin.position.x, msg.info.origin.position.y))
+
+    def off_wall(self, points):
+        """Scan points (map frame) that are not on a wall of the saved map."""
+        if self.walls is None or not self.ignore_walls:
+            return points
+        walls, res, origin = self.walls
+        return points[distances(walls, res, origin, points) > self.wall_margin]
 
     def on_reset(self, request, response):
         self.observations.clear()
@@ -125,23 +146,18 @@ class TargetLocalizer(Node):
         """TF at the given time, falling back to the latest transform."""
         try:
             return self.tf_buffer.lookup_transform(target, source, Time.from_msg(stamp), Duration(seconds=0.1))
-        except TransformException:
-            try:
-                return self.tf_buffer.lookup_transform(target, source, Time())
-            except TransformException as e:
-                self.get_logger().warn(f'TF {target}<-{source}: {e}', throttle_duration_sec=5.0)
-                return None
+        except TransformException as e:
+            self.get_logger().warn(f'TF {target}<-{source} at the message time unavailable, using the latest: {e}',
+                                   throttle_duration_sec=5.0)
+        try:
+            return self.tf_buffer.lookup_transform(target, source, Time())
+        except TransformException as e:
+            self.get_logger().warn(f'TF {target}<-{source}: {e}', throttle_duration_sec=5.0)
+            return None
 
     def scan_points_in_frame(self, scan):
         tf = self.lookup(self.frame, scan.header.frame_id, scan.header.stamp)
-        if tf is None:
-            return None
-        x0, y0, yaw = transform_to_xyyaw(tf)
-        r = np.asarray(scan.ranges, dtype=float)
-        a = scan.angle_min + scan.angle_increment * np.arange(r.size)
-        ok = np.isfinite(r) & (r > scan.range_min) & (r < scan.range_max)
-        r, a = r[ok], a[ok] + yaw
-        return np.column_stack((x0 + r * np.cos(a), y0 + r * np.sin(a)))
+        return scan_to_points(scan, *transform_to_xyyaw(tf)) if tf is not None else None
 
     # ---------------------------------------------------------------- core
     def on_detections(self, msg):
@@ -153,10 +169,7 @@ class TargetLocalizer(Node):
             return
         ox, oy, cam_yaw = apply_body_offset(*transform_to_xyyaw(cam_tf), *self.cam_offset)
 
-        if self.K is not None:
-            fx, cx = self.K[0, 0], self.K[0, 2]
-        else:
-            fx, cx = focal_length_px(msg.image_width, self.hfov), msg.image_width / 2.0
+        fx, cx = intrinsics(self.K, msg.image_width, self.hfov)
 
         scan = self.closest_scan(msg.header.stamp)
         points = self.scan_points_in_frame(scan) if scan is not None else None
@@ -167,16 +180,20 @@ class TargetLocalizer(Node):
         # Search window: the inner half of the box, clipped to a sensible angular range.
         half = min(max(self.half_width, 0.25 * det.width / fx), math.radians(6.0))
 
-        rng, source = None, ''
+        rng, source, wall_rng = None, '', None
         if points is not None:
-            rng, n = ray_range_from_scan((ox, oy), ray_yaw, points, half,
-                                         self.min_range, self.max_range, self.cluster_depth)
+            limits = (half, self.min_range, self.max_range, self.cluster_depth)
+            rng, n = ray_range_from_scan((ox, oy), ray_yaw, self.off_wall(points), *limits)
+            if rng is None:
+                wall_rng, _ = ray_range_from_scan((ox, oy), ray_yaw, points, *limits)
             source = f'lidar({n})' if rng is not None else ''
         if rng is None and self.target_height > 0.0:
             rng = range_from_object_height(det.height, self.target_height, fx)
             source = 'size'
         if rng is None or not (self.min_range <= rng <= self.max_range):
-            self.get_logger().info(f'{det.class_name} at bearing {math.degrees(bearing):+.0f} deg: no range',
+            why = (f'the LiDAR only hits a map wall there, at {wall_rng:.2f} m: beam above or beside the target?'
+                   if wall_rng is not None else 'no LiDAR hit')
+            self.get_logger().info(f'{det.class_name} at bearing {math.degrees(bearing):+.0f} deg: no range ({why})',
                                    throttle_duration_sec=2.0)
             return
 
@@ -211,45 +228,21 @@ class TargetLocalizer(Node):
         self.publish_markers(est, confirmed, stamp)
 
     def publish_markers(self, est, confirmed, stamp):
-        arr = MarkerArray()
-        pts = Marker()
-        pts.header.frame_id, pts.header.stamp = self.frame, stamp
-        pts.ns, pts.id, pts.type = 'observations', 0, Marker.POINTS
-        pts.scale.x = pts.scale.y = 0.04
-        pts.color.r, pts.color.g, pts.color.b, pts.color.a = 1.0, 0.6, 0.0, 0.8
-        for x, y, *_ in self.observations:
-            pts.points.append(Point(x=x, y=y, z=0.05))
-        arr.markers.append(pts)
-
-        m = Marker()
-        m.header.frame_id, m.header.stamp = self.frame, stamp
-        m.ns, m.id, m.type = 'estimate', 1, Marker.CYLINDER
-        m.pose.position.x, m.pose.position.y, m.pose.position.z = est[0], est[1], 0.1
-        m.pose.orientation.w = 1.0
-        m.scale.x = m.scale.y = 0.15
-        m.scale.z = 0.2
-        m.color.g = 1.0 if confirmed else 0.5
-        m.color.r = 0.0 if confirmed else 1.0
-        m.color.a = 0.8
-        arr.markers.append(m)
-
-        txt = Marker()
-        txt.header = m.header
-        txt.ns, txt.id, txt.type = 'estimate_label', 2, Marker.TEXT_VIEW_FACING
-        txt.pose.position.x, txt.pose.position.y, txt.pose.position.z = est[0], est[1], 0.45
-        txt.pose.orientation.w = 1.0
-        txt.scale.z = 0.12
-        txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
+        obs = marker(self.frame, 'observations', 0, Marker.POINTS, 0.04, (1.0, 0.6, 0.0, 0.8), stamp=stamp)
+        obs.points = [Point(x=x, y=y, z=0.05) for x, y, *_ in self.observations]
+        cyl = marker(self.frame, 'estimate', 1, Marker.CYLINDER, (0.15, 0.15, 0.2),
+                     (0.0, 1.0, 0.0, 0.8) if confirmed else (1.0, 0.5, 0.0, 0.8), est, 0.1, stamp)
+        txt = marker(self.frame, 'estimate_label', 2, Marker.TEXT_VIEW_FACING, 0.12, (1.0, 1.0, 1.0, 1.0), est, 0.45,
+                     stamp)
         txt.text = f'target ({est[0]:.2f}, {est[1]:.2f})' + (' OK' if confirmed else '?')
-        arr.markers.append(txt)
-        self.pub_markers.publish(arr)
+        self.pub_markers.publish(MarkerArray(markers=[obs, cyl, txt]))
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = TargetLocalizer()
     try:
-        rclpy.spin(node)
+        rclpy.spin(node, executor=MultiThreadedExecutor(num_threads=2))
     except KeyboardInterrupt:
         pass
     finally:

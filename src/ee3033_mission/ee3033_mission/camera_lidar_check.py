@@ -30,9 +30,9 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 from ee3033_interfaces.msg import TargetDetectionArray
 
-from .geometry import apply_body_offset, focal_length_px, nearest_cluster_bearing, pixel_to_bearing, wrap_angle
+from .geometry import (apply_body_offset, intrinsics, nearest_cluster_bearing, pixel_to_bearing, scan_to_points,
+                       transform_to_xyyaw, wrap_angle)
 from .target_detector import image_msg_to_bgr
-from .target_localizer import transform_to_xyyaw
 
 
 class CameraLidarCheck(Node):
@@ -89,17 +89,6 @@ class CameraLidarCheck(Node):
         x, y, yaw = transform_to_xyyaw(tf)
         return apply_body_offset(x, y, yaw, self.offset[0], self.offset[1], 0.0)
 
-    def scan_points(self):
-        r = np.asarray(self.scan.ranges, dtype=float)
-        a = self.scan.angle_min + self.scan.angle_increment * np.arange(r.size)
-        ok = np.isfinite(r) & (r > self.scan.range_min) & (r < self.scan.range_max)
-        return np.column_stack((r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])))
-
-    def intrinsics(self, width):
-        if self.K is not None:
-            return self.K[0, 0], self.K[0, 2]
-        return focal_length_px(width, self.hfov), width / 2.0
-
     def on_detections(self, msg):
         if self.done or self.scan is None or not msg.detections:
             return
@@ -109,9 +98,9 @@ class CameraLidarCheck(Node):
             self.get_logger().warn(f'TF: {e}', throttle_duration_sec=5.0)
             return
         det = max(msg.detections, key=lambda d: d.score)
-        fx, cx = self.intrinsics(msg.image_width)
+        fx, cx = intrinsics(self.K, msg.image_width, self.hfov)
         b_cam = pixel_to_bearing(det.center_u, cx, fx)
-        bearing, rng, n = nearest_cluster_bearing((cx_l, cy_l), cam_yaw + b_cam, self.scan_points(), self.half)
+        bearing, rng, n = nearest_cluster_bearing((cx_l, cy_l), cam_yaw + b_cam, scan_to_points(self.scan), self.half)
         if bearing is None:
             self.get_logger().info('No LiDAR object near the detection', throttle_duration_sec=2.0)
             return
@@ -146,9 +135,9 @@ class CameraLidarCheck(Node):
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f'No overlay: {e}')
             return
-        pts = self.scan_points() - np.array([cx_l, cy_l])
+        pts = scan_to_points(self.scan) - np.array([cx_l, cy_l])
         rng = np.hypot(pts[:, 0], pts[:, 1])
-        fx, cx = self.intrinsics(img.shape[1])
+        fx, cx = intrinsics(self.K, img.shape[1], self.hfov)
         panels = []
         for yaw_deg, label in ((self.current_yaw, 'current'), (suggested, 'suggested')):
             im = img.copy()

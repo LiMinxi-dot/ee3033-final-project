@@ -1,7 +1,11 @@
-"""Pure geometry helpers for the target search mission (no ROS imports, unit-testable)."""
+"""Pure geometry helpers for the target search mission (no ROS imports, unit-testable).
+
+Functions taking ROS messages only read their fields, so tests can pass simple stand-ins.
+"""
 
 import math
 
+import cv2
 import numpy as np
 
 
@@ -12,6 +16,26 @@ def wrap_angle(a):
 
 def yaw_from_quaternion(x, y, z, w):
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def yaw_to_quaternion(yaw):
+    """(x, y, z, w) of a rotation by yaw about z."""
+    return 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+
+
+def transform_to_xyyaw(tf):
+    """Planar pose (x, y, yaw) of a geometry_msgs/TransformStamped."""
+    t, q = tf.transform.translation, tf.transform.rotation
+    return t.x, t.y, yaw_from_quaternion(q.x, q.y, q.z, q.w)
+
+
+def scan_to_points(scan, x0=0.0, y0=0.0, yaw=0.0):
+    """Valid hits of a sensor_msgs/LaserScan as an (N, 2) array, moved by the scan frame pose (x0, y0, yaw)."""
+    r = np.asarray(scan.ranges, dtype=float)
+    a = scan.angle_min + scan.angle_increment * np.arange(r.size)
+    ok = np.isfinite(r) & (r > scan.range_min) & (r < scan.range_max)
+    r, a = r[ok], a[ok] + yaw
+    return np.column_stack((x0 + r * np.cos(a), y0 + r * np.sin(a)))
 
 
 def apply_body_offset(x, y, yaw, dx, dy, dyaw):
@@ -25,6 +49,13 @@ def focal_length_px(image_width, hfov_rad):
     return (image_width / 2.0) / math.tan(hfov_rad / 2.0)
 
 
+def intrinsics(K, image_width, hfov_rad):
+    """(fx, cx) from the calibrated camera matrix K, or from the field of view if K is None."""
+    if K is not None:
+        return K[0, 0], K[0, 2]
+    return focal_length_px(image_width, hfov_rad), image_width / 2.0
+
+
 def pixel_to_bearing(u, cx, fx):
     """Horizontal bearing (rad) of pixel column u in the camera body frame.
 
@@ -36,35 +67,25 @@ def pixel_to_bearing(u, cx, fx):
 
 def ray_range_from_scan(origin_xy, ray_yaw, points_xy, half_width_rad,
                         min_range=0.15, max_range=6.0, cluster_depth=0.15):
-    """Distance along a ray to the nearest object seen by the LiDAR.
+    """Distance along a ray to the nearest object seen by the LiDAR: (range, n_points) or (None, 0).
 
-    points_xy are LiDAR hits already in the same frame as the ray origin.
-    Points whose bearing (seen from the origin) is within half_width_rad of the
-    ray are kept, and the nearest cluster of them (within cluster_depth of the
-    closest one) gives the range. Returns (range, n_points) or (None, 0).
+    See nearest_cluster_bearing; points_xy are LiDAR hits in the frame of the ray origin.
     """
-    pts = np.asarray(points_xy, dtype=float).reshape(-1, 2)
-    if pts.size == 0:
-        return None, 0
-    d = pts - np.asarray(origin_xy, dtype=float)
-    r = np.hypot(d[:, 0], d[:, 1])
-    ang = np.arctan2(d[:, 1], d[:, 0])
-    keep = (np.abs(wrap_angle(ang - ray_yaw)) <= half_width_rad) & (r >= min_range) & (r <= max_range)
-    r = r[keep]
-    if r.size == 0:
-        return None, 0
-    r_min = r.min()
-    near = r[r <= r_min + cluster_depth]
-    return float(np.median(near)), int(near.size)
+    _, r, n = nearest_cluster_bearing(origin_xy, ray_yaw, points_xy, half_width_rad,
+                                      min_range, max_range, cluster_depth)
+    return r, n
 
 
 def nearest_cluster_bearing(origin_xy, ray_yaw, points_xy, half_width_rad,
                             min_range=0.3, max_range=3.0, cluster_depth=0.15):
     """Bearing and range of the nearest LiDAR cluster within half_width_rad of a ray.
 
-    Used for camera/LiDAR yaw calibration: the camera gives ray_yaw, the LiDAR
-    tells where the object really is. Returns (bearing, range, n_points) with the
-    bearing in the same frame as ray_yaw, or (None, None, 0).
+    Points whose bearing (seen from the origin) is within half_width_rad of the
+    ray are kept; the nearest cluster of them (within cluster_depth of the
+    closest one) gives the median range and bearing. For the camera/LiDAR yaw
+    calibration the camera gives ray_yaw and the LiDAR tells where the object
+    really is. Returns (bearing, range, n_points) with the bearing in the same
+    frame as ray_yaw, or (None, None, 0).
     """
     pts = np.asarray(points_xy, dtype=float).reshape(-1, 2)
     if pts.size == 0:
@@ -131,8 +152,6 @@ def generate_viewpoints(grid, resolution, origin_xy, start_xy, spacing,
     Viewpoints within skip_radius of the start are dropped (the robot already
     looks around there). Returns a list of (x, y) in the map frame.
     """
-    import cv2  # local import keeps the module importable without OpenCV for pure tests
-
     grid = np.asarray(grid)
     free = ((grid >= 0) & (grid < occupied_thresh)).astype(np.uint8)
     # Distance (m) from each free cell to the nearest occupied or unknown cell.
@@ -170,6 +189,58 @@ def generate_viewpoints(grid, resolution, origin_xy, start_xy, spacing,
         if all(math.hypot(x - vx, y - vy) >= 0.5 * spacing for vx, vy in viewpoints):
             viewpoints.append((x, y))
     return viewpoints
+
+
+def plan_coverage(grid, resolution, origin_xy, start_xy, view_range, min_clearance, candidate_spacing=0.25,
+                  occupied_thresh=50, sample=0.10, min_gain=0.01):
+    """Viewpoints from which the whole free space is seen (the robot spins 360 deg at each one).
+
+    Candidates come from generate_viewpoints() on a fine grid (reachable, clear of walls). A free cell
+    (sampled every `sample` m) is seen from a point if it is within view_range and the straight line
+    to it crosses no occupied or unknown cell. The start counts as a viewpoint if it is clear enough
+    for the initial spin. Greedy set cover: take the candidate that sees the most still unseen cells
+    until no candidate adds min_gain of the cells.
+    Returns (viewpoints, fraction of the free cells seen, fraction seeable from any candidate).
+    """
+    grid = np.asarray(grid)
+    free = (grid >= 0) & (grid < occupied_thresh)
+    h, w = grid.shape
+    step = max(1, int(round(sample / resolution)))
+    rows, cols = np.nonzero(free)
+    keep = (rows % step == 0) & (cols % step == 0)
+    tx = origin_xy[0] + (cols[keep] + 0.5) * resolution
+    ty = origin_xy[1] + (rows[keep] + 0.5) * resolution
+    if tx.size == 0:
+        return [], 0.0, 0.0
+    k = np.linspace(0.0, 1.0, int(view_range / (resolution / 2)) + 2)[1:-1]   # samples between the ends
+
+    def seen_from(x, y):
+        near = np.hypot(tx - x, ty - y) <= view_range
+        px = x + np.outer(tx[near] - x, k)
+        py = y + np.outer(ty[near] - y, k)
+        c = np.clip(np.floor((px - origin_xy[0]) / resolution).astype(int), 0, w - 1)
+        r = np.clip(np.floor((py - origin_xy[1]) / resolution).astype(int), 0, h - 1)
+        seen = np.zeros(tx.size, bool)
+        seen[near] = free[r, c].all(axis=1)
+        return seen
+
+    candidates = generate_viewpoints(grid, resolution, origin_xy, start_xy, candidate_spacing, min_clearance,
+                                     occupied_thresh)
+    views = [seen_from(x, y) for x, y in candidates]
+    seeable = np.logical_or.reduce(views) if views else np.zeros(tx.size, bool)
+    clear = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 5) * resolution
+    sr, sc = world_to_grid(start_xy[0], start_xy[1], origin_xy, resolution)
+    start_ok = 0 <= sr < h and 0 <= sc < w and clear[sr, sc] >= min_clearance
+    covered = seen_from(*start_xy) if start_ok else np.zeros(tx.size, bool)
+    picked = []
+    while views:
+        gains = [int((v & ~covered).sum()) for v in views]
+        i = int(np.argmax(gains))
+        if gains[i] < max(1, min_gain * tx.size):
+            break
+        picked.append(candidates.pop(i))
+        covered |= views.pop(i)
+    return picked, float(covered.mean()), float((seeable | covered).mean())
 
 
 def order_nearest_neighbour(start_xy, points):

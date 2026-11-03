@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*.yaml')),
         ('share/' + package_name + '/rviz', glob('rviz/*.rviz')),
+        ('lib/' + package_name, ['scripts/demo.sh']),   # ros2 run ee3033_mission demo.sh mapping|mission|stop
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,6 +28,8 @@ setup(
             'target_localizer = ee3033_mission.target_localizer:main',
             'mission_manager = ee3033_mission.mission_manager:main',
             'cmd_vel_watchdog = ee3033_mission.cmd_vel_watchdog:main',
+            'auto_mapper = ee3033_mission.auto_mapper:main',
+            'wait_for_transform = ee3033_mission.wait_for_transform:main',
             'setup_check = ee3033_mission.setup_check:main',
             'camera_lidar_check = ee3033_mission.camera_lidar_check:main',
         ],

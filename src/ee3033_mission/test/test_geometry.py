@@ -1,12 +1,14 @@
 import math
+from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
 
 from ee3033_mission.geometry import (apply_body_offset, focal_length_px, fuse_observations, generate_viewpoints,
-                                     nearest_cluster_bearing, order_nearest_neighbour, pixel_to_bearing,
-                                     range_from_object_height,
-                                     ray_range_from_scan, wrap_angle, yaw_from_quaternion)
+                                     intrinsics, nearest_cluster_bearing, order_nearest_neighbour, pixel_to_bearing,
+                                     plan_coverage,
+                                     range_from_object_height, ray_range_from_scan, scan_to_points,
+                                     transform_to_xyyaw, wrap_angle, yaw_from_quaternion, yaw_to_quaternion)
 
 
 def test_wrap_angle():
@@ -17,6 +19,31 @@ def test_wrap_angle():
 def test_yaw_from_quaternion():
     yaw = 0.7
     assert yaw_from_quaternion(0, 0, math.sin(yaw / 2), math.cos(yaw / 2)) == pytest.approx(yaw)
+
+
+def test_yaw_to_quaternion_round_trip():
+    for yaw in (-3.0, -0.4, 0.0, 1.2, 3.1):
+        assert yaw_from_quaternion(*yaw_to_quaternion(yaw)) == pytest.approx(yaw)
+
+
+def test_transform_to_xyyaw():
+    _, _, z, w = yaw_to_quaternion(0.5)
+    tf = NS(transform=NS(translation=NS(x=1.0, y=-2.0, z=0.3), rotation=NS(x=0.0, y=0.0, z=z, w=w)))
+    assert transform_to_xyyaw(tf) == pytest.approx((1.0, -2.0, 0.5))
+
+
+def test_scan_to_points_drops_invalid_and_applies_pose():
+    scan = NS(ranges=[1.0, float('inf'), 0.01, 2.0], angle_min=0.0, angle_increment=math.pi / 2,
+              range_min=0.05, range_max=10.0)
+    assert scan_to_points(scan) == pytest.approx(np.array([[1.0, 0.0], [0.0, -2.0]]), abs=1e-9)  # beams 0 and 270 deg
+    # scan frame at (1, 1) facing +y: the first beam (straight ahead) ends at (1, 2)
+    assert scan_to_points(scan, 1.0, 1.0, math.pi / 2)[0] == pytest.approx((1.0, 2.0))
+
+
+def test_intrinsics_prefers_calibration():
+    K = np.array([[500.0, 0, 330.0], [0, 500.0, 240.0], [0, 0, 1]])
+    assert intrinsics(K, 640, math.radians(60)) == (500.0, 330.0)
+    assert intrinsics(None, 640, math.radians(60)) == pytest.approx((focal_length_px(640, math.radians(60)), 320.0))
 
 
 def test_apply_body_offset():
@@ -112,3 +139,25 @@ def test_viewpoints_are_not_duplicated():
 def test_order_nearest_neighbour():
     tour = order_nearest_neighbour((0, 0), [(5, 0), (1, 0), (3, 0)])
     assert tour == [(1, 0), (3, 0), (5, 0)]
+
+
+def room(w_m, h_m, res=0.05):
+    g = np.zeros((int(h_m / res), int(w_m / res)), np.int16)
+    g[0, :] = g[-1, :] = g[:, 0] = g[:, -1] = 100
+    return g
+
+
+def test_coverage_open_room_needs_no_extra_viewpoint():
+    g = room(1.5, 1.5)
+    vps, seen, _ = plan_coverage(g, 0.05, (0, 0), (0.75, 0.75), view_range=1.5, min_clearance=0.2)
+    assert vps == [] and seen > 0.99            # the spin at the start sees everything
+
+
+def test_coverage_adds_a_viewpoint_behind_a_wall_and_near_a_tight_start():
+    g = room(3.0, 2.5)
+    g[0:35, 30] = 100                            # partition from the bottom wall, 1.75 m long, at x = 1.5
+    vps, seen, seeable = plan_coverage(g, 0.05, (0, 0), (0.5, 0.5), view_range=1.5, min_clearance=0.2)
+    assert seen > 0.95 and seeable > 0.95
+    assert any(x > 1.55 for x, _ in vps)         # one on the other side of the partition
+    vps2, _, _ = plan_coverage(g, 0.05, (0, 0), (0.08, 0.5), view_range=1.5, min_clearance=0.2)
+    assert len(vps2) >= len(vps)                 # start against the wall: its spin does not count

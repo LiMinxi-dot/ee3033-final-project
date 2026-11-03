@@ -1,0 +1,84 @@
+import math
+import re
+
+import numpy as np
+import pytest
+
+from ee3033_mission.geometry import grid_to_world
+from ee3033_mission.scan_match import best_alignment, localization_verdict, match_fraction, transform, wall_distance
+
+RES, ORIGIN = 0.05, (-0.5, -0.5)
+
+
+def room():
+    """2.0 m x 1.5 m room with a box near one corner (so it has no rotational symmetry)."""
+    g = np.zeros((32, 42), np.int16)
+    g[0, :] = g[-1, :] = g[:, 0] = g[:, -1] = 100
+    g[20:26, 30:36] = 100
+    return g
+
+
+def scan_from(grid, pose):
+    """Every wall cell centre, as seen from the sensor at pose (sensor frame)."""
+    rows, cols = np.nonzero(grid >= 50)
+    pts = np.array([grid_to_world(r, c, ORIGIN, RES) for r, c in zip(rows, cols)])
+    x, y, yaw = pose
+    return transform(pts - (x, y), 0.0, 0.0, -yaw)
+
+
+@pytest.fixture(scope='module')
+def setup():
+    g = room()
+    true_pose = (0.6, 0.4, 0.3)
+    return wall_distance(g, RES), scan_from(g, true_pose), true_pose
+
+
+def test_scan_fits_at_true_pose(setup):
+    dist, pts, pose = setup
+    assert match_fraction(dist, RES, ORIGIN, pts, pose) > 0.95
+
+
+def test_turned_robot_is_detected_and_explained(setup):
+    dist, pts, (x, y, yaw) = setup
+    believed = (x, y, yaw + math.radians(60))         # the robot is really turned 60 deg to the right
+    assert match_fraction(dist, RES, ORIGIN, pts, believed) < 0.5
+    dx, dy, dyaw = best_alignment(dist, RES, ORIGIN, pts, believed)
+    assert math.degrees(dyaw) == pytest.approx(-60, abs=1.5)
+    assert math.hypot(dx, dy) < 0.03
+
+
+def test_shifted_robot_is_explained(setup):
+    dist, pts, (x, y, yaw) = setup
+    dx, dy, dyaw = best_alignment(dist, RES, ORIGIN, pts, (x + 0.15, y - 0.10, yaw))
+    assert (dx, dy) == pytest.approx((-0.15, 0.10), abs=0.02)
+    assert abs(math.degrees(dyaw)) < 1.5
+
+
+def test_points_outside_the_map_do_not_match(setup):
+    dist, _, _ = setup
+    assert match_fraction(dist, RES, ORIGIN, np.array([[5.0, 5.0]]), (0.0, 0.0, 0.0)) == 0.0
+
+
+def test_verdict_in_plain_words(setup):
+    dist, pts, (x, y, yaw) = setup
+    ok, frac, lines = localization_verdict(dist, RES, ORIGIN, pts, (x, y, yaw))
+    assert ok and frac > 0.95 and lines == ['best fit 100%: heading OK, position OK']
+    ok, frac, lines = localization_verdict(dist, RES, ORIGIN, pts, (x, y, yaw - math.radians(45)))
+    assert not ok
+    assert re.search(r'turned 4[456] deg further LEFT, position OK', lines[-1])
+
+
+def test_verdict_says_back_and_right(setup):
+    dist, pts, (x, y, yaw) = setup
+    # believed pose 15 cm ahead and 10 cm left of the true one (robot frame): really 15 cm back, 10 cm right
+    c, s = math.cos(yaw), math.sin(yaw)
+    ok, _, lines = localization_verdict(dist, RES, ORIGIN, pts, (x + 0.15 * c - 0.10 * s, y + 0.15 * s + 0.10 * c, yaw))
+    assert not ok
+    assert re.search(r'heading OK, 1[78] cm off \(1[456] cm back, (9|10|11) cm right\)', lines[-1]), lines[-1]
+
+
+def test_small_error_fails_when_a_nearby_pose_fits_clearly_better(setup):
+    dist, pts, (x, y, yaw) = setup
+    ok, frac, lines = localization_verdict(dist, RES, ORIGIN, pts, (x, y, yaw + math.radians(12)), need=0.0)
+    assert not ok                                   # passes any absolute threshold, but 12 deg off
+    assert re.search(r'turned 1[123] deg further RIGHT', lines[-1]), lines[-1]
