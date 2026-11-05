@@ -4,11 +4,12 @@ from types import SimpleNamespace as NS
 import numpy as np
 import pytest
 
-from ee3033_mission.geometry import (apply_body_offset, focal_length_px, fuse_observations, generate_viewpoints,
-                                     intrinsics, nearest_cluster_bearing, order_nearest_neighbour, pixel_to_bearing,
-                                     plan_coverage,
-                                     range_from_object_height, ray_range_from_scan, scan_to_points,
-                                     transform_to_xyyaw, wrap_angle, yaw_from_quaternion, yaw_to_quaternion)
+from ee3033_mission.geometry import (apply_body_offset, escape_move, focal_length_px, free_ahead,
+                                     fuse_observations, generate_viewpoints, intrinsics, nearest_cluster_bearing,
+                                     order_nearest_neighbour, pixel_to_bearing, plan_coverage,
+                                     range_from_object_height, ray_range_from_scan, rotation_clear,
+                                     scan_to_points, transform_to_xyyaw, wall_sdf, wrap_angle,
+                                     yaw_from_quaternion, yaw_to_quaternion)
 
 
 def test_wrap_angle():
@@ -161,3 +162,59 @@ def test_coverage_adds_a_viewpoint_behind_a_wall_and_near_a_tight_start():
     assert any(x > 1.55 for x, _ in vps)         # one on the other side of the partition
     vps2, _, _ = plan_coverage(g, 0.05, (0, 0), (0.08, 0.5), view_range=1.5, min_clearance=0.2)
     assert len(vps2) >= len(vps)                 # start against the wall: its spin does not count
+
+
+def wall_x(width_cells=3):
+    g = np.zeros((40, 40), np.int16)
+    g[:, 20:20 + width_cells] = 100              # wall from x = 1.00 m, 15 cm thick
+    return g, wall_sdf(g, 0.05)
+
+
+def test_wall_sdf_is_negative_inside_walls():
+    g, sdf = wall_x()
+    assert sdf[10, 19] == pytest.approx(0.05) and sdf[10, 21] == pytest.approx(-0.10)
+    assert sdf[10, 20] == pytest.approx(-0.05) and sdf[10, 23] == pytest.approx(0.05)
+
+
+def test_escape_moves_straight_away_from_the_wall():
+    g, sdf = wall_x()
+    pose = (0.94, 0.5)                           # 0.10 m from the wall (cell centres), Nav2's inscribed zone
+    d, clear = escape_move(g, sdf, 0.05, (0, 0), (*pose, math.pi), 0.14, 0.25, 0.15)     # facing away
+    assert d == pytest.approx(0.05) and clear >= 0.14
+    d, clear = escape_move(g, sdf, 0.05, (0, 0), (*pose, 0.0), 0.14, 0.25, 0.15)         # facing the wall
+    assert d == pytest.approx(-0.05) and clear >= 0.14
+    assert escape_move(g, sdf, 0.05, (0, 0), (*pose, math.pi / 2), 0.14, 0.25, 0.15) is None   # along it
+
+
+def test_escape_never_crosses_a_wall():
+    g, sdf = wall_x()
+    d, _ = escape_move(g, sdf, 0.05, (0, 0), (1.02, 0.5, 0.0), 0.14, 0.25, 0.15)  # centre in the wall, facing across
+    assert d < 0                                 # back out the way it came, not through to x > 1.15
+    # LiDAR sees an obstacle ahead (no forward move allowed) and behind is the wall: nothing to do
+    assert escape_move(g, sdf, 0.05, (0, 0), (0.94, 0.5, math.pi), 0.14, 0.0, 0.15) is None
+
+
+def test_escape_ends_on_known_free_cells_only():
+    g, sdf = wall_x()
+    g[:, :19] = -1                               # unknown space right behind the robot
+    assert escape_move(g, sdf, 0.05, (0, 0), (0.94, 0.5, math.pi), 0.14, 0.25, 0.15) is None
+
+
+def side_wall(gap, side=1):
+    """LiDAR hits of a wall along the robot's left (side=1) or right side, `gap` m from its 0.10 m half width."""
+    return np.column_stack((np.linspace(-0.5, 0.5, 201), np.full(201, side * (0.10 + gap))))
+
+
+def test_free_ahead_counts_only_what_the_robot_width_sweeps():
+    pts = np.array([[0.30, 0.05], [0.20, 0.15], [-0.20, 0.0]])        # ahead, beside the path, behind
+    assert free_ahead(pts, 0.07, 0.11) == pytest.approx(0.23)
+    assert free_ahead(pts, 0.07, 0.11, turn=math.radians(37)) == pytest.approx(0.25 - 0.07, abs=0.01)
+    assert free_ahead(pts[2:], 0.07, 0.11) == float('inf')
+
+
+def test_rotation_clear_depends_on_the_gap_to_the_wall():
+    for side in (1, -1):
+        assert rotation_clear(side_wall(0.04, side), 0.07, 0.11, math.radians(90))     # corners sweep 0.13 m
+        assert rotation_clear(side_wall(0.04, side), 0.07, 0.11, math.radians(-90))
+        assert not rotation_clear(side_wall(0.02, side), 0.07, 0.11, math.radians(30))  # a corner hits it
+        assert not rotation_clear(side_wall(0.02, side), 0.07, 0.11, math.radians(-30))

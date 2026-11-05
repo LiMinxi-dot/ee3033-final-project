@@ -11,12 +11,12 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, RegisterEventHandler,
-                            TimerAction)
+from launch.actions import (DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, LogInfo,
+                            RegisterEventHandler, TimerAction)
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetParameter
 
 
 def include(pkg, name, args=None):
@@ -35,7 +35,7 @@ def generate_launch_description():
                    parameters=[{'target_frame': 'map', 'source_frame': 'base_footprint'}])
     after_amcl = RegisterEventHandler(OnProcessExit(target_action=wait_tf, on_exit=[
         LogInfo(msg='[ee3033] AMCL is localized: starting Nav2'),
-        include('balance_navigation', 'balance_nav2_core.launch.py')]))
+        include('ee3033_mission', 'nav2.launch.py')]))
 
     return LaunchDescription([
         DeclareLaunchArgument('map', description='Map yaml saved in step 1'),
@@ -45,9 +45,10 @@ def generate_launch_description():
         include('ee3033_mission', 'base_sensors.launch.py'),
         TimerAction(period=2.0, actions=[include('ee3033_mission', 'perception.launch.py', {
             'params_file': params, 'video_device': LaunchConfiguration('video_device')})]),
-        TimerAction(period=6.0, actions=[LogInfo(msg='[ee3033] starting map server + AMCL'),
-                                         include('balance_navigation', 'balance_amcl_localization.launch.py',
-                                                 {'map': LaunchConfiguration('map')})]),
+        TimerAction(period=6.0, actions=[LogInfo(msg='[ee3033] starting map server + AMCL'), GroupAction([
+            SetParameter(name='bond_timeout', value=0.0),  # no bond shutdowns, as for Nav2 (nav2.launch.py)
+            include('balance_navigation', 'balance_amcl_localization.launch.py',
+                    {'map': LaunchConfiguration('map')})])]),
         # mission_manager sets the AMCL initial pose; Nav2 starts once AMCL publishes map -> base_footprint
         # (it aborts its bringup if that transform is missing while its costmaps activate).
         after_amcl,

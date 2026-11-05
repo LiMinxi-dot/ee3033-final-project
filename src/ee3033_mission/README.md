@@ -29,19 +29,24 @@ Frontier exploration on the live SLAM Toolbox map (`ros2 launch ee3033_mission m
 1. Frontiers: free cells next to unknown cells, grouped into clusters; clusters shorter than `min_frontier_size` are noise.
 2. Traversable space: free cells at least `robot_radius` from occupied cells. A wavefront from the robot gives the
    path length to every reachable cell. A frontier's goal is the reachable cell closest to its centre (within `goal_reach`).
-3. Cost = path length − `gain_weight` × frontier size. The cheapest frontier is sent to Nav2.
-4. The goal is kept until its frontier disappears (explored on the way), Nav2 fails or progress stops; failed
+3. Cost = path length − `gain_weight` × frontier size. The robot drives to the cheapest frontier's goal along a
+   route, like the way home: straight legs along corridor centres (≥ `route_clearance` from walls and unknown space),
+   turning in place at each corner; Nav2 drives each leg. One long Nav2 goal cut the corner of a 0.45 m gap and the
+   robot hit the wall. Without a route on the map, Nav2 gets the whole way.
+4. The goal is kept until its frontier disappears (explored on the way), Nav2 fails or progress along the route stops; failed
    frontiers are blacklisted. After reaching a goal the node waits for a fresh map; a frontier that is still there
    cannot be resolved from there and is blacklisted.
 5. No reachable frontier for `finish_wait` s (or `max_duration`) → save the map, drive back to the start pose
-   (same heading, so the mission can use the map origin as initial pose), save again.
+   (same heading, so the mission can use the map origin as initial pose). The map after the return goes to
+   `<map_file>_after_return` only: the mission keeps the one from the end of the exploration.
 
 Before `/explore/start` the node is a dry run: it shows the frontiers and the goal it would choose but does not move.
 Offline tests on the VM: `scripts/sim_explore.py --demo` (no ROS) and `scripts/fake_world.py` (fake SLAM + Nav2).
 
 ## Target localization
 
-1. YOLOv8n (imgsz 320, about 9 Hz on the Pi 5) detects the target class.
+1. YOLOv8n (imgsz 640, about 5 Hz on the Pi 5 with 2 threads) detects the target class (at 320 a bottle 0.7 m
+   away scored 0.2, below the thresholds).
 2. The box centre column gives the bearing in `camera_link` (`camera_info` K if calibrated, else `hfov_deg`).
 3. TF at the image time turns the bearing into a ray in `map`.
 4. The `/scan_fixed` scan closest in time, transformed to `map`, gives the range: the nearest cluster of hits around the ray. Hits on the walls of the saved map are ignored (`ignore_map_walls`): the target is never part of the map, so a beam passing above or beside the target must not give its range. If `target_height` > 0, the box height gives a fallback range.
@@ -53,9 +58,12 @@ The start pose is the map origin, because mapping starts at the start position. 
 1. Sets the AMCL initial pose (heading uncertainty `initial_yaw_std_deg`) and lets AMCL settle with no-motion updates.
 2. Localization check: at the pose AMCL reports, at least `min_scan_match` of the LiDAR points must lie on the map walls.
    If not, the robot does not move. The log lines starting with `[loc]` say how the robot really is placed, e.g.
-   "turned 60 deg further LEFT, 15 cm off (+14 cm forward, +6 cm left)", and the check repeats every 5 s until the
-   robot is back on the start mark. AMCL only corrects itself after the odometry reports motion, so a robot that turns
-   without the odometry noticing (balance drift, wheel slip, moved by hand) would otherwise stay mislocalized.
+   "turned 60 deg further LEFT, 15 cm off (+14 cm forward, +6 cm left)". If the scan clearly fits one nearby pose
+   (at least `calibrate_min_fit` of the points on walls, and any other heading 20 deg or more away fits worse by
+   `calibrate_margin`), that pose becomes AMCL's initial pose and the check runs again (auto-calibration, at most
+   `max_calibrations` times). Otherwise the check repeats every 5 s until the robot is back on the start mark.
+   AMCL only corrects itself after the odometry reports motion, so a robot that turns without the odometry
+   noticing (balance drift, wheel slip, moved by hand) would otherwise stay mislocalized.
 3. Spins once at the start.
 4. Plans viewpoints on the saved map so that the whole free space is seen (the number is up to the planner):
    candidates are reachable cells at least `min_clearance` from walls on a `candidate_spacing` grid; a free cell
@@ -66,6 +74,20 @@ The start pose is the map origin, because mapping starts at the start position. 
    there (warning only).
 6. Stops as soon as the target is confirmed, reports it with the last localization check (`scan_match` in the
    result file), and navigates home.
+
+Escape from walls (both nodes): a robot closer than `escape_trigger` to a map wall gets no help from Nav2 (Smac:
+"Starting point in lethal space", spin and back-up: "Collision Ahead"). Before every Nav2 goal, and once after a
+goal that failed, such a robot first moves (through the velocity smoother) to where the map shows `escape_target`
+clearance: straight forward or backward, never through a wall, forward only as far as the LiDAR shows the robot's
+rectangle (`body_half_length`, `body_half_width`) free, backward at most `escape_max_backward` (the LiDAR cannot
+see behind the robot). If that does not get it clear (e.g. it stands along the wall), it first turns in place by
+the smallest angle whose sweep of its corners the LiDAR shows free. On site the robot drifted during a viewpoint
+spin into a wall that the map shows thicker than it is and stood there until the mission gave up.
+
+Stuck goals (both nodes): a Nav2 goal during which the robot moves less than `stuck_move` for `stuck_time` s
+ends, as reached if the robot is within `stuck_accept` of it, else as failed (escape and retry as above); a route
+leg whose waypoint the robot is already within `leg_skip` of is skipped; `nav_timeout` 30 s per goal. On site
+the robot stood 0.14 m from two such goals while Nav2 kept replanning, until the 60 s timeout each time.
 
 ## Demo procedure
 
@@ -83,9 +105,10 @@ Logs: `/tmp/ee3033_mapping.log`, `/tmp/ee3033_mission.log`. The manual steps bel
 
 What the mission prints and what to do:
 - `[loc] LOCALIZATION CHECK FAILED (at the start) ... turned 13 deg further RIGHT, 7 cm off (...)`: the robot is not
-  where the program thinks. Put it on the start mark facing the start direction; the check repeats every 5 s and
-  the robot leaves by itself once it passes. If the arena changed since mapping and the check keeps failing,
-  `ros2 service call /mission/start std_srvs/srv/Trigger` starts anyway.
+  where the program thinks. Followed by `AUTO-CALIBRATION 1/3 ...`: nothing to do, the program takes the pose that
+  fits the scan and checks again 2 s later. Otherwise put the robot on the start mark facing the start direction;
+  the check repeats every 5 s and the robot leaves by itself once it passes. If the arena changed since mapping and
+  the check keeps failing, `ros2 service call /mission/start std_srvs/srv/Trigger` starts anyway.
 - `[plan] N viewpoints ... see X% of the free space`: the planner chose N itself. A second `[plan]` line warns if
   part of the free space cannot be seen from anywhere the robot can reach.
 - `[loc] ... (viewpoint k)` warnings: localization degraded while searching; the report then says POOR.
