@@ -12,8 +12,13 @@ target_detector:
                                    # set to the demo target. It must reach the LiDAR plane (~19 cm)
                                    # and not be transparent/shiny, or set target_height below.
     conf_threshold: 0.45
-    imgsz: 320                     # 320: ~9 FPS on the Pi 5 (PyTorch); 640: ~3 FPS
-    max_rate: 10.0
+    imgsz: 640                     # Pi 5, 2 threads, robot standing: 320 69 ms/frame, 416 93, 480 120, 544 143,
+                                   # 640 185. A 0.205 m bottle 0.7 m away scored 0.21 at 320 (below conf_threshold
+                                   # and the localizer's min_score: three site missions found nothing), 0.67 at
+                                   # 416, 0.89 at 640 upright (0.41-0.51 upside down)
+    max_rate: 5.0                  # frames/s at most; at the 0.5 rad/s spin a target stays ~2 s in view
+    num_threads: 2                 # PyTorch threads (0 = all 4 cores). With all cores YOLO ran back to back
+                                   # (load 5-7) and Nav2 missed a 4 s heartbeat in the site mission
     debug_image: true              # annotated JPEG on /target_detector/debug_image/compressed
     debug_rate: 2.0
 
@@ -31,21 +36,54 @@ auto_mapper:
     global_frame: map
     robot_frame: base_footprint
     auto_start: false              # false: start with ros2 service call /explore/start std_srvs/srv/Trigger
-    robot_radius: 0.15             # m; goals and paths keep this far from walls (robot radius 0.12)
-    min_frontier_size: 0.20        # m; shorter frontiers are SLAM noise
+    robot_radius: 0.15             # m; paths keep this far from walls (robot radius 0.12)
+    unknown_clearance: 0.20        # m; goals keep this far from unknown space (it may hide a wall the LiDAR missed)
+    goal_clearance: 0.15           # m; goals keep this far from walls: a goal at a wall (e.g. for
+                                   # (0.20 left frontiers behind 0.4 m passages unexplored in test mazes)
+                                   # a frontier seen through a gap) left the robot where Nav2 could not plan or recover
+    min_frontier_size: 0.15        # m; shorter frontiers are SLAM noise (0.20 dropped the frontier of a narrow opening
+                                   # seen at an angle, 3 cells, and the region behind it stayed unmapped; test mazes:
+                                   # 0.15 explores as completely with +4.5 % path, 0.10 +11 %)
     goal_reach: 0.5                # m; the goal is a safe cell at most this far from the frontier
     gain_weight: 0.3               # cost = path length - gain_weight * frontier size
     blacklist_radius: 0.3
+    blacklist_shrink: 0.7          # goal reached but >= this share of its frontier left -> blacklist (a large
+                                   # frontier partly resolved stays open; test maze: a 1.45 m frontier was
+                                   # blacklisted whole after one look and that corner stayed unmapped)
     max_radius: 0.0                # m from home; > 0 ignores frontiers outside (e.g. LiDAR seeing out of the sandbox)
     replan_period: 1.0
     progress_timeout: 15.0         # s without getting 0.1 m closer -> blacklist the frontier
-    nav_timeout: 60.0
+    finish_goals: true             # frontier explored on the way: still drive to its goal while that is safe and
+                                   # reachable (site: all goals on one side were cancelled after the LiDAR saw past
+                                   # a thin wall end-on, and the wall was missing from the map)
+    nav_timeout: 30.0              # s per Nav2 goal (route legs are at most route_max_leg long)
+    stuck_time: 8.0                # s; a Nav2 goal during which the robot moves less than stuck_move ends:
+    stuck_move: 0.05               # m  reached if within stuck_accept of it, else failed (escape, retry)
+    stuck_accept: 0.20             # m
+    leg_skip: 0.15                 # m; a route leg whose waypoint is this close already is skipped
     settle_timeout: 6.0            # max wait for a fresh /map after reaching a goal
     finish_wait: 6.0               # s without any reachable frontier -> exploration done
     max_duration: 300.0            # s, then return home anyway
     return_home: true
     home_retries: 2
     home_tolerance: 0.25
+    route_clearance: 0.15          # m; the way home is planned through cells this far from walls/unknown, along
+                                   # corridor centres, and driven in straight legs of at most route_max_leg
+    route_max_leg: 0.8
+    turn_first_deg: 45.0           # goal direction more than this off the heading: turn in place first (Nav2
+                                   # spin); DWB turned in a forward arc into the wall next to the robot. 0 = off
+    escape: true                   # robot closer than escape_trigger to a map wall (Nav2 will neither plan nor
+    escape_trigger: 0.11           # turn there; Nav2 robot_radius 0.10 + padding 0.01): before a goal, and once
+                                   # after a failed one, drive straight
+    escape_target: 0.14            # away from the wall (m from the walls to reach); if no straight move gets
+                                   # clear, first turn in place as far as the LiDAR shows the corners free
+    escape_max_forward: 0.25       # m; and only as far as the LiDAR shows the robot's width free ahead
+    escape_max_backward: 0.15      # m; the LiDAR cannot see behind the robot: the map alone decides
+    escape_speed: 0.05             # m/s, through the velocity smoother (/cmd_vel_nav)
+    escape_turn_speed: 0.3         # rad/s
+    escape_margin: 0.01            # m around the robot's rectangle in the LiDAR checks
+    body_half_length: 0.06         # m; the robot is 0.115 m long and 0.20 m wide (camera cable on the left)
+    body_half_width: 0.10
     map_file: /home/ros2_ws/maps/sandbox   # writes sandbox.pgm + sandbox.yaml
 
 target_localizer:
@@ -94,20 +132,47 @@ mission_manager:
                                    # (home arena: 87-99 % when localized, 11-48 % when 56-65 deg off)
     scan_match_margin: 0.10        # also fail if a nearby pose fits better by this much: in a small arena
                                    # 60 % of the points still land near a wall when the robot is 20-40 deg off
+    auto_calibrate: true           # failed check at the start: if the scan clearly fits one nearby pose (robot
+                                   # placed askew, or turned while waiting: site 25 deg, then 0.45 deg/s), use it as
+                                   # AMCL's initial pose and check again ([loc] AUTO-CALIBRATION lines)
+    calibrate_min_fit: 0.90        # ... needs this fraction of the LiDAR points on the walls at that pose (98-100 %
+                                   # on site when the robot was misplaced; < 55 % when it fitted nowhere)
+    calibrate_margin: 0.10         # ... and any separate fit peak at a heading >= 20 deg away must fit worse by
+                                   # this much (an arena that looks alike from two headings is left to the operator)
+    max_calibrations: 3            # per /mission/start
     scan_topic: /scan_fixed
-    scan_min_range: 0.075          # m; closer LiDAR hits are the robot itself (4-5 cm behind the LiDAR); the same
-                                   # limit is set for SLAM in mapping.launch.py (min_laser_range)
+    scan_min_range: 0.13           # m; closer LiDAR hits are the robot itself (below 6.5 cm, now and then up to
+                                   # 12 cm behind the LiDAR); the same limit is set for SLAM (mapping.launch.py,
+                                   # min_laser_range) and the costmaps (nav2.launch.py, obstacle_min_range)
     initial_spin: true
     spin_angle_deg: 360.0
     view_range: 1.5                # m; the planner places viewpoints (the number is up to it) so that every free
                                    # cell is within this distance and in line of sight of one of them
-                                   # (YOLO imgsz 320 finds the target reliably up to about this distance)
+                                   # (YOLO must find the target this far away: check on site, see imgsz)
     candidate_spacing: 0.25        # m; grid of candidate viewpoints
-    min_clearance: 0.20            # m from walls/unknown space (robot radius 0.12, Nav2 inflation 0.20)
+    min_clearance: 0.15            # m from walls/unknown space (0.20 cut off two rooms behind 0.30-0.34 m passages
+                                   # on site map 1105_043031: 61 % seen instead of 96 %; mapping drives at 0.15 too)
     max_viewpoints: 40
-    nav_timeout: 60.0
+    nav_timeout: 30.0              # s per Nav2 goal (route legs are at most route_max_leg long)
+    stuck_time: 8.0                # s; a Nav2 goal during which the robot moves less than stuck_move ends:
+    stuck_move: 0.05               # m  reached if within stuck_accept of it, else failed (escape, retry)
+    stuck_accept: 0.20             # m
+    leg_skip: 0.15                 # m; a route leg whose waypoint is this close already is skipped
     spin_timeout: 25.0
     home_tolerance: 0.25
     home_retries: 2
+    route_clearance: 0.15          # m; routes to viewpoints and home: straight legs along corridor centres
+    route_max_leg: 0.8
+    turn_first_deg: 45.0           # as auto_mapper
+    escape: true                   # as auto_mapper (a viewpoint spin left the robot in a map wall: stuck)
+    escape_trigger: 0.11
+    escape_target: 0.14
+    escape_max_forward: 0.25
+    escape_max_backward: 0.15
+    escape_speed: 0.05
+    escape_turn_speed: 0.3
+    escape_margin: 0.01
+    body_half_length: 0.06
+    body_half_width: 0.10
     report_unconfirmed: true       # report the best guess if the target was never confirmed
     result_file: /home/ros2_ws/mission_result.yaml

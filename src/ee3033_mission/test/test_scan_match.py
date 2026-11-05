@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 
 from ee3033_mission.geometry import grid_to_world
-from ee3033_mission.scan_match import best_alignment, localization_verdict, match_fraction, transform, wall_distance
+from ee3033_mission.scan_match import (best_alignment, calibration, localization_verdict, match_fraction, scan_verdict,
+                                       transform, wall_distance)
 
 RES, ORIGIN = 0.05, (-0.5, -0.5)
 
@@ -82,3 +83,45 @@ def test_small_error_fails_when_a_nearby_pose_fits_clearly_better(setup):
     ok, frac, lines = localization_verdict(dist, RES, ORIGIN, pts, (x, y, yaw + math.radians(12)), need=0.0)
     assert not ok                                   # passes any absolute threshold, but 12 deg off
     assert re.search(r'turned 1[123] deg further RIGHT', lines[-1]), lines[-1]
+
+
+def test_robot_placed_askew_is_calibrated(setup):
+    dist, pts, (x, y, yaw) = setup
+    believed = (x + 0.08, y - 0.05, yaw - math.radians(30))     # really 30 deg further left and a bit off
+    v = scan_verdict(dist, RES, ORIGIN, pts, believed)
+    fix, why = calibration(v)
+    assert not v.ok and fix is not None, why
+    corrected = (believed[0] + fix[0], believed[1] + fix[1], believed[2] + fix[2])
+    assert corrected == pytest.approx((x, y, yaw), abs=0.03)
+    assert localization_verdict(dist, RES, ORIGIN, pts, corrected)[0]
+
+
+def test_no_calibration_where_the_arena_looks_alike():
+    g = np.zeros((40, 40), np.int16)                  # square room: turned by 90 deg it looks the same
+    g[0, :] = g[-1, :] = g[:, 0] = g[:, -1] = 100
+    true_pose = (0.475, 0.475, 0.0)                   # centre of the room
+    dist, pts = wall_distance(g, RES), scan_from(g, true_pose)
+    v = scan_verdict(dist, RES, ORIGIN, pts, (0.475, 0.475, math.radians(30)))
+    assert not v.ok and v.fit > 0.9 and v.other_fit > 0.9
+    fix, why = calibration(v)
+    assert fix is None and 'looks alike' in why
+
+
+def test_no_calibration_when_nothing_fits_or_all_is_well(setup):
+    dist, pts, pose = setup
+    assert calibration(scan_verdict(dist, RES, ORIGIN, pts, pose))[0] is None              # check passes
+    rng = np.random.default_rng(0)
+    noise = rng.uniform(-0.3, 0.3, (200, 2))                                               # fits no wall
+    fix, why = calibration(scan_verdict(dist, RES, ORIGIN, noise, pose))
+    assert fix is None and 'well enough' in why
+
+
+def test_corridor_shift_does_not_block_calibration():
+    g = np.zeros((20, 80), np.int16)                  # 3.9 m long, 0.9 m wide corridor, closed at both ends
+    g[0, :] = g[-1, :] = g[:, 0] = g[:, -1] = 100
+    true_pose = (0.5, 0.0, 0.0)                       # near the left end
+    dist, pts = wall_distance(g, RES), scan_from(g, true_pose)
+    v = scan_verdict(dist, RES, ORIGIN, pts, (0.5, 0.0, math.radians(-25)))
+    fix, why = calibration(v)
+    assert fix is not None, why
+    assert math.degrees(fix[2]) == pytest.approx(25, abs=1.5)

@@ -4,8 +4,11 @@
 
 IDLE      dry run: frontiers and the goal it would choose are published on
           /explore/frontiers, but the robot does not move.
-EXPLORE   every replan_period: find frontiers on /map, send the cheapest
-          reachable one to Nav2 (navigate_to_pose). The goal is kept until its
+EXPLORE   every replan_period: find frontiers on /map and drive to the goal of
+          the cheapest reachable one along a route (straight legs along corridor
+          centres, turning in place at the corners, as for the way home: a long
+          Nav2 goal cut the corner of a 0.45 m gap and the robot hit the wall
+          there). The goal is kept until its
           frontier disappears (explored), Nav2 fails or the robot stops making
           progress; failed frontiers are blacklisted. After a goal is reached
           the node waits for a fresh /map; if the same frontier is still there
@@ -14,8 +17,10 @@ EXPLORE   every replan_period: find frontiers on /map, send the cheapest
           seconds or after max_duration.
 RETURN    navigates back to the start pose (same heading, so the mission in
           step 2 can use the map origin as the initial pose).
-DONE      the map is saved to map_file.{pgm,yaml} (also at the end of EXPLORE,
-          in case the return fails).
+DONE      the map from the end of EXPLORE stays in map_file.{pgm,yaml} (saved
+          before the return); the map after the return goes to
+          map_file_after_return.{pgm,yaml} only: on the way home the robot once
+          went faster on a long straight leg, tilted, and distorted the map.
 /explore/stop cancels the Nav2 goal and stops the robot at any time (/explore/start
 then resumes with the same home pose and blacklist);
 /explore/save_map saves the current map (also usable while mapping by teleop).
@@ -28,7 +33,8 @@ from geometry_msgs.msg import Point
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .exploration import BLACKLISTED, OK, TOO_FAR, UNREACHABLE, near_any, plan_frontiers, save_map_files
+from .exploration import (BLACKLISTED, OK, TOO_FAR, UNREACHABLE, frontier_left, goal_reachable, near_any,
+                          plan_frontiers, save_map_files)
 from .geometry import yaw_from_quaternion
 from .nav_node import NavStateNode, run
 from .ros_helpers import marker
@@ -37,14 +43,18 @@ STATUS_COLOURS = {OK: (0.1, 0.9, 0.1), BLACKLISTED: (0.9, 0.1, 0.1),
                   UNREACHABLE: (0.5, 0.5, 0.5), TOO_FAR: (0.9, 0.6, 0.1)}
 
 PARAMS = {
-    'robot_radius': 0.15,        # min distance of a goal/path cell from walls (m)
-    'min_frontier_size': 0.20,   # ignore shorter frontiers (m)
+    'robot_radius': 0.15,        # min distance of a path cell from walls (m)
+    'goal_clearance': 0.15,      # min distance of a goal from walls (m)
+    'unknown_clearance': 0.20,   # min distance of a goal from unknown space (m)
+    'min_frontier_size': 0.15,   # ignore shorter frontiers (m)
     'goal_reach': 0.5,           # goal at most this far from the frontier (m)
     'gain_weight': 0.3,          # cost = path length - gain_weight * frontier size
     'blacklist_radius': 0.3,
+    'blacklist_shrink': 0.7,     # this share of the frontier still left after reaching its goal -> blacklist
     'max_radius': 0.0,           # ignore frontiers further from home (m), 0 = off
     'replan_period': 1.0,
     'progress_timeout': 15.0,    # s without getting 0.1 m closer -> give up goal
+    'finish_goals': True,        # frontier explored on the way: drive on to its goal if it is still safe
     'settle_timeout': 6.0,       # max wait for a fresh /map after reaching a goal
     'finish_wait': 6.0,          # s with no frontier before exploration ends
     'max_duration': 300.0,       # s, then return home anyway
@@ -62,9 +72,11 @@ class AutoMapper(NavStateNode):
         self.blacklist = []           # frontier centres (x, y) never to try again
         self.target = None            # frontier centre currently driven to
         self.goal = None              # its Nav2 goal (x, y)
-        self.reached = None           # frontier centre of the last goal reached, checked after the next /map
+        self.reached = None           # (frontier centre, size) of the last goal reached, checked after the next /map
+        self.target_size = 0.0
         self.settle_until = None      # (map_count, deadline) while waiting for a fresh map
         self.no_frontier_since = None
+        self.seen_on_the_way = False  # the current target frontier was explored before its goal was reached
         self.progress = None          # (best distance to goal, time it was set)
         self.n_goals = 0
         self.last_plan = 0.0
@@ -77,16 +89,18 @@ class AutoMapper(NavStateNode):
                               robot_radius=float(c['robot_radius']), min_frontier_size=float(c['min_frontier_size']),
                               goal_reach=float(c['goal_reach']), gain_weight=float(c['gain_weight']),
                               blacklist=self.blacklist, blacklist_radius=float(c['blacklist_radius']),
-                              home_xy=self.home[:2] if self.home else None, max_radius=float(c['max_radius']))
+                              home_xy=self.home[:2] if self.home else None, max_radius=float(c['max_radius']),
+                              goal_clearance=float(c['goal_clearance']),
+                              unknown_clearance=float(c['unknown_clearance']))
 
-    def save_map(self):
+    def save_map(self, path_base=None):
         if self.map is None:
             return False, 'no map received yet'
         grid, resolution, (x0, y0) = self.map_grid()
         q = self.map.info.origin.orientation
         origin = (x0, y0, yaw_from_quaternion(q.x, q.y, q.z, q.w))
         try:
-            path = save_map_files(self.cfg['map_file'], grid, resolution, origin)
+            path = save_map_files(path_base or self.cfg['map_file'], grid, resolution, origin)
         except OSError as e:
             self.get_logger().error(f'Map not saved: {e}')
             return False, str(e)
@@ -130,14 +144,14 @@ class AutoMapper(NavStateNode):
         radius = float(self.cfg['blacklist_radius'])
 
         if self.target is not None:                 # driving to a frontier
-            if not any(f.status == OK and near_any(f.centre, [self.target], radius) for f in frontiers):
-                self.get_logger().info('Current frontier explored or no longer reachable; choosing the next one')
-                self.cancel_action()
-                self.target = None
-            else:
+            if any(f.status == OK and near_any(f.centre, [self.target], radius) for f in frontiers) or \
+                    self.drive_on(pose):
                 self.check_progress(pose)
                 self.publish_markers(frontiers)
                 return
+            self.get_logger().info('Current frontier explored or no longer reachable; choosing the next one')
+            self.cancel_action()
+            self.target = None
 
         if self.settle_until is not None:           # goal reached: wait for a map that includes the new view
             count, deadline = self.settle_until
@@ -145,10 +159,13 @@ class AutoMapper(NavStateNode):
                 self.publish_markers(frontiers)
                 return
             self.settle_until = None
-            if self.reached is not None and any(f.status == OK and near_any(f.centre, [self.reached], radius)
-                                                for f in frontiers):
-                self.blacklist_point(self.reached, 'still a frontier after reaching it')
-                frontiers, seeded = self.plan(pose[:2])
+            if self.reached is not None:
+                (centre, size), left = self.reached, frontier_left(frontiers, self.reached[0], radius)
+                if left >= float(self.cfg['blacklist_shrink']) * size:
+                    self.blacklist_point(centre, f'still a frontier after reaching it ({left:.2f} of {size:.2f} m)')
+                    frontiers, seeded = self.plan(pose[:2])
+                elif left > 0:       # a large frontier is seldom resolved from one place: keep the rest open
+                    self.get_logger().info(f'Frontier shrank from {size:.2f} to {left:.2f} m; the rest stays open')
             self.reached = None
 
         best = frontiers[0] if frontiers and frontiers[0].status == OK else None
@@ -167,9 +184,9 @@ class AutoMapper(NavStateNode):
             return
         self.no_frontier_since = None
 
-        self.target, self.goal = best.centre, best.goal
+        self.target, self.goal, self.target_size = best.centre, best.goal, best.size
+        self.seen_on_the_way = False
         self.n_goals += 1
-        self.progress = (math.hypot(best.goal[0] - pose[0], best.goal[1] - pose[1]), time.time())
         yaw = math.atan2(best.centre[1] - best.goal[1], best.centre[0] - best.goal[0])
         if math.hypot(best.centre[0] - best.goal[0], best.centre[1] - best.goal[1]) < 0.05:
             yaw = math.atan2(best.goal[1] - pose[1], best.goal[0] - pose[0])
@@ -177,10 +194,34 @@ class AutoMapper(NavStateNode):
                                f'size {best.size:.2f} m -> drive to ({best.goal[0]:.2f}, {best.goal[1]:.2f}), '
                                f'path {best.distance:.2f} m, {sum(f.status == OK for f in frontiers)} open frontiers')
         target = self.target
-        self.send_nav(best.goal[0], best.goal[1], yaw, lambda ok: self.on_goal_result(ok, target))
+        self.send_route(best.goal[0], best.goal[1], yaw, lambda ok: self.on_goal_result(ok, target),
+                        f'Goal {self.n_goals}')
+        self.progress = (self.remaining(pose), time.time())
+
+    def remaining(self, pose):
+        """Distance left to the goal along the route (straight line if there is none)."""
+        d = self.route_remaining(pose)
+        return d if d is not None else math.hypot(self.goal[0] - pose[0], self.goal[1] - pose[1])
+
+    def drive_on(self, pose):
+        """The target frontier is gone (explored from afar): keep driving to its goal while it is still a safe,
+        reachable goal. A thin wall seen end-on from afar shows only its end; the site map lost a whole wall when
+        the goals of a far side were all cancelled because the LiDAR had seen past it."""
+        if not self.cfg['finish_goals']:
+            return False
+        grid, resolution, origin = self.map_grid()
+        c = self.cfg
+        if not goal_reachable(grid, resolution, origin, pose[:2], self.goal, robot_radius=float(c['robot_radius']),
+                              goal_clearance=float(c['goal_clearance']),
+                              unknown_clearance=float(c['unknown_clearance'])):
+            return False
+        if not self.seen_on_the_way:
+            self.seen_on_the_way = True
+            self.get_logger().info('Frontier explored on the way; driving on to its goal to see the area up close')
+        return True
 
     def check_progress(self, pose):
-        d = math.hypot(self.goal[0] - pose[0], self.goal[1] - pose[1])
+        d = self.remaining(pose)
         best, since = self.progress
         if d < best - 0.1:
             self.progress = (d, time.time())
@@ -198,7 +239,7 @@ class AutoMapper(NavStateNode):
             self.nav_active = False
             self.set_state('WAIT_SYSTEM')
         elif success:
-            self.reached = target
+            self.reached = (target, self.target_size)
             self.settle_until = (self.map_count, time.time() + float(self.cfg['settle_timeout']))
         else:
             self.blacklist_point(target, 'Nav2 failed or timed out')
@@ -216,7 +257,10 @@ class AutoMapper(NavStateNode):
             self.set_state('DONE')
 
     def on_home_reached(self):
-        self.save_map()
+        ok, path = self.save_map(self.cfg['map_file'] + '_after_return')
+        if ok:
+            self.get_logger().info(f'The mission uses the map from the end of the exploration '
+                                   f'({self.cfg["map_file"]}.yaml), not this one')
 
     # ---------------------------------------------------------------- visualisation
     def publish_markers(self, frontiers, best=None):

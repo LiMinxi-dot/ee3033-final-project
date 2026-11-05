@@ -5,10 +5,13 @@
 LOCALIZE  publishes the initial pose for AMCL (the start position is the map
           origin because mapping starts there) and lets AMCL settle with
           no-motion updates. Then the localization check: the LiDAR scan must
-          fit the map walls at the pose AMCL reports. If it does not, the robot
-          does not move; the log says how the robot is really placed, and the
-          check is repeated until it passes (robot put back on the start mark), or
-          /mission/start is called again to start anyway.
+          fit the map walls at the pose AMCL reports. If it does not but the scan
+          clearly fits one nearby pose (robot placed askew or turned while
+          waiting), that pose becomes AMCL's initial pose and the check is
+          repeated (auto-calibration, at most max_calibrations times). Otherwise
+          the robot does not move; the log says how the robot is really placed,
+          and the check is repeated until it passes (robot put back on the start
+          mark), or /mission/start is called again to start anyway.
           Then it records the home pose and spins once in place, which both
           helps AMCL converge and looks for the target around the start.
 SEARCH    plans viewpoints from which the whole free space of the saved map is
@@ -30,20 +33,17 @@ import numpy as np
 import yaml
 from geometry_msgs.msg import PointStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import Spin
-from rclpy.action import ActionClient
-from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
 from tf2_ros import TransformException
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ee3033_interfaces.msg import TargetEstimate
 
-from .geometry import order_nearest_neighbour, plan_coverage, scan_to_points, transform_to_xyyaw
+from .geometry import apply_body_offset, order_nearest_neighbour, plan_coverage, scan_to_points, transform_to_xyyaw
 from .nav_node import NavStateNode, run
 from .ros_helpers import LATCHED, marker
-from .scan_match import localization_verdict, wall_distance
+from .scan_match import calibration, scan_verdict, wall_distance
 
 PARAMS = {
     'set_initial_pose': True,
@@ -54,13 +54,15 @@ PARAMS = {
     'localization_check': True,          # the LiDAR scan must fit the map before the robot moves
     'min_scan_match': 0.75,              # fraction of LiDAR points that must lie on the map walls
     'scan_match_margin': 0.10,           # fail if a nearby pose fits better by this much
-    'scan_topic': '/scan_fixed',
-    'scan_min_range': 0.075,             # m; closer LiDAR hits are the robot itself
+    'auto_calibrate': True,              # failed check at the start: use the pose that clearly fits the scan
+    'calibrate_min_fit': 0.90,           # ... if this fraction of the points lie on the walls there
+    'calibrate_margin': 0.10,            # ... and any other heading >= 20 deg away fits worse by this much
+    'max_calibrations': 3,               # per /mission/start; then the operator has to place the robot
     'initial_spin': True,
     'spin_angle_deg': 360.0,
     'view_range': 1.5,                   # m; the target is found reliably up to this distance
     'candidate_spacing': 0.25,           # m; grid of candidate viewpoints for the coverage planner
-    'min_clearance': 0.20,               # m; viewpoints keep this far from walls and unknown space
+    'min_clearance': 0.15,               # m; viewpoints keep this far from walls and unknown space
     'max_viewpoints': 40,
     'spin_timeout': 25.0,
     'report_unconfirmed': True,
@@ -72,7 +74,6 @@ class MissionManager(NavStateNode):
 
     def __init__(self):
         super().__init__('mission_manager', 'mission', PARAMS)
-        self.spin = ActionClient(self, Spin, 'spin')
         self.estimate = None
         self.create_subscription(TargetEstimate, '/target/estimate', self.on_estimate, LATCHED)
         self.pub_target = self.create_publisher(PointStamped, '/mission/target', LATCHED)
@@ -80,15 +81,14 @@ class MissionManager(NavStateNode):
         self.pub_vp = self.create_publisher(MarkerArray, '/mission/viewpoints', LATCHED)
         self.reset_localizer = self.create_client(Empty, '/target_localizer/reset')
         self.nomotion = self.create_client(Empty, '/request_nomotion_update')   # AMCL update without motion
-        self.scan = None
-        self.create_subscription(LaserScan, self.cfg['scan_topic'], lambda m: setattr(self, 'scan', m),
-                                 qos_profile_sensor_data)
         self.walls = None             # (map_count, distance to the nearest wall per cell)
         self.loc_match = None         # (fraction of scan points on walls, where) of the last check
         self.loc_since = 0.0          # initial pose sent at
         self.loc_retry = None         # failed check: try again at
         self.loc_failed = False       # the check at the start has failed (the operator may start anyway)
         self.loc_override = False     # operator started anyway (/mission/start while the check fails)
+        self.calibrations = 0         # initial poses set from the scan (auto-calibration) since begin()
+        self.loc_calibrated = False   # the last check set the initial pose from the scan
         self.last_nomotion = 0.0
         self.viewpoints = []
         self.vp_index = 0
@@ -118,8 +118,8 @@ class MissionManager(NavStateNode):
         goal.time_allowance.sec = int(self.cfg['spin_timeout'])
         self.run_action(self.spin, goal, float(self.cfg['spin_timeout']) + 5.0, on_done)
 
-    def publish_initial_pose(self):
-        x, y, yaw = self.cfg['initial_pose']
+    def publish_initial_pose(self, pose=None):
+        x, y, yaw = pose if pose is not None else self.cfg['initial_pose']
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = self.frame
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -134,6 +134,7 @@ class MissionManager(NavStateNode):
 
     def begin(self):
         self.t_start = time.time()
+        self.calibrations = 0
         self.start_localization()
         self.set_state('LOCALIZE')
         return True
@@ -167,8 +168,10 @@ class MissionManager(NavStateNode):
             return
         if not self.loc_override and not self.check_localization('at the start', [
                 'Put the robot on the start mark, facing the start direction. It will not move; checking again in 5 s.',
-                'To start anyway: ros2 service call /mission/start std_srvs/srv/Trigger']):
-            self.loc_retry, self.loc_failed = time.time() + 5.0, True
+                'To start anyway: ros2 service call /mission/start std_srvs/srv/Trigger'],
+                calibrate=bool(self.cfg['auto_calibrate'])):
+            if not self.loc_calibrated:         # calibrated: checked again after localize_wait
+                self.loc_retry, self.loc_failed = time.time() + 5.0, True
             return
         self.home = pose
         self.get_logger().info('Home pose ({:.2f}, {:.2f}, {:.0f} deg)'.format(
@@ -178,19 +181,24 @@ class MissionManager(NavStateNode):
         else:
             self.start_search()
 
-    def check_localization(self, where, advice):
+    def check_localization(self, where, advice, calibrate=False):
         """True if the LiDAR scan fits the map walls at the pose AMCL reports (advice: lines shown if not).
 
         Otherwise logs, in plain words, how the robot is really placed compared with what the program
         believes (best-fitting pose correction). All lines start with [loc] (shown by demo.sh).
+        With calibrate, a correction that is clear (scan_match.calibration) is applied instead of showing the
+        advice: AMCL gets the corrected robot pose as its initial pose (self.loc_calibrated is then True).
         """
+        self.loc_calibrated = False
         if not self.cfg['localization_check']:
             return True
         log = self.get_logger()
         try:
             if self.scan is None:
                 raise TransformException(f'no scan on {self.cfg["scan_topic"]}')
-            pose = transform_to_xyyaw(self.tf_buffer.lookup_transform(self.frame, self.scan.header.frame_id, Time()))
+            sensor = self.scan.header.frame_id
+            pose = transform_to_xyyaw(self.tf_buffer.lookup_transform(self.frame, sensor, Time()))
+            robot_in_sensor = transform_to_xyyaw(self.tf_buffer.lookup_transform(sensor, self.robot_frame, Time()))
         except TransformException as e:
             log.error(f'[loc] Cannot check the localization ({where}): {e}')
             return False
@@ -199,19 +207,40 @@ class MissionManager(NavStateNode):
             self.walls = (self.map_count, wall_distance(grid, res))
         points = scan_to_points(self.scan)
         points = points[np.hypot(points[:, 0], points[:, 1]) >= float(self.cfg['scan_min_range'])]
-        ok, frac, lines = localization_verdict(self.walls[1], res, origin, points, pose,
-                                               float(self.cfg['min_scan_match']), float(self.cfg['scan_match_margin']))
-        self.loc_match = (frac, where)
-        if ok:
-            log.info(f'[loc] Localization check OK ({where}): {frac:.0%} of the LiDAR points lie on the map walls '
-                     f'({lines[0]})')
+        v = scan_verdict(self.walls[1], res, origin, points, pose,
+                         float(self.cfg['min_scan_match']), float(self.cfg['scan_match_margin']))
+        self.loc_match = (v.frac, where)
+        if v.ok:
+            log.info(f'[loc] Localization check OK ({where}): {v.frac:.0%} of the LiDAR points lie on the map walls '
+                     f'({v.lines[0]})')
             return True
-        lines = ['!' * 70, f'LOCALIZATION CHECK FAILED ({where}): ' + lines[0]] + lines[1:] + advice + ['!' * 70]
+        fix = None
+        if calibrate and self.calibrations >= int(self.cfg['max_calibrations']):
+            advice = [f'No auto-calibration: already done {self.calibrations} times.'] + advice
+        elif calibrate:
+            fix, why = calibration(v, float(self.cfg['calibrate_min_fit']), float(self.cfg['calibrate_margin']))
+            if fix is None:
+                advice = [f'No auto-calibration: {why}.'] + advice
+        if fix is not None:
+            sensor_pose = (pose[0] + fix[0], pose[1] + fix[1], pose[2] + fix[2])
+            x, y, yaw = apply_body_offset(*sensor_pose, *robot_in_sensor)
+            self.calibrations += 1
+            advice = [f'AUTO-CALIBRATION {self.calibrations}/{int(self.cfg["max_calibrations"])}: no other pose fits '
+                      f'as well (next best {v.other_fit:.0%}), so the program now uses that pose: '
+                      f'({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f} deg). Checking again in '
+                      f'{float(self.cfg["localize_wait"]):.0f} s.']
+        lines = ['!' * 70, f'LOCALIZATION CHECK FAILED ({where}): ' + v.lines[0]] + v.lines[1:] + advice + ['!' * 70]
         for line in lines:
             if where == 'at the start':       # rclpy: one severity per call site
                 log.error('[loc] ' + line)
             else:
                 log.warn('[loc] ' + line)
+        if fix is not None:
+            if self.reset_localizer.service_is_ready():     # observations made with the wrong pose
+                self.reset_localizer.call_async(Empty.Request())
+            self.publish_initial_pose((x, y, yaw))
+            self.loc_since = time.time()
+            self.loc_calibrated = True
         return False
 
     def plan_viewpoints(self):
@@ -253,8 +282,8 @@ class MissionManager(NavStateNode):
         x, y = self.viewpoints[self.vp_index]
         here = self.robot_pose() or self.home
         yaw = math.atan2(y - here[1], x - here[0])
-        self.get_logger().info(f'Viewpoint {self.vp_index + 1}/{len(self.viewpoints)} -> ({x:.2f}, {y:.2f})')
-        self.send_nav(x, y, yaw, self.on_viewpoint_reached)
+        self.send_route(x, y, yaw, self.on_viewpoint_reached,
+                        f'Viewpoint {self.vp_index + 1}/{len(self.viewpoints)} -> ({x:.2f}, {y:.2f})')
 
     def on_viewpoint_reached(self, success):
         if not success:

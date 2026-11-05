@@ -243,6 +243,85 @@ def plan_coverage(grid, resolution, origin_xy, start_xy, view_range, min_clearan
     return picked, float(covered.mean()), float((seeable | covered).mean())
 
 
+def wall_sdf(grid, resolution, occupied_thresh=50):
+    """Signed distance (m) of every cell to the map walls: outside a wall the distance to the nearest wall cell,
+    inside one minus the distance to the nearest cell that is not a wall."""
+    wall = np.asarray(grid) >= occupied_thresh
+    out = cv2.distanceTransform((~wall).astype(np.uint8), cv2.DIST_L2, 5)
+    inside = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
+    return (out - inside) * resolution
+
+
+def escape_move(grid, sdf, resolution, origin_xy, pose, target, max_forward, max_backward, occupied_thresh=50):
+    """Straight move along the robot's heading away from the map walls, as (d, clearance at the end): d > 0
+    forward, d < 0 backward. The shortest move that ends at least `target` from the walls (forward unless
+    backward is clearly shorter); if none gets that far, the one that gains the most (at least one cell).
+    None if no move helps.
+
+    Next to a wall Nav2 does not move the robot at all: the planner says "Starting point in lethal space" and its
+    spin and back-up say "Collision Ahead". A move never gets closer to a wall than it already got on the way
+    (half a cell of tolerance), so it cannot cross a thin wall to its other side, and it ends on a free cell.
+    sdf: wall_sdf() of grid.
+    """
+    x, y, yaw = pose
+    c, s = math.cos(yaw), math.sin(yaw)
+    h, w = sdf.shape
+    step = resolution / 2
+
+    def at(px, py):
+        row, col = world_to_grid(px, py, origin_xy, resolution)
+        return (float(sdf[row, col]), int(grid[row, col])) if 0 <= row < h and 0 <= col < w else (None, None)
+
+    start, _ = at(x, y)
+    if start is None:
+        return None
+    options = []                      # (d, clearance) of the moves that end on a free cell
+    for sign, limit in ((1, max_forward), (-1, max_backward)):
+        top, d = start, step
+        while d <= limit + 1e-9:
+            v, g = at(x + sign * d * c, y + sign * d * s)
+            if v is None or v < top - step:
+                break
+            top = max(top, v)
+            if 0 <= g < occupied_thresh:
+                options.append((sign * d, v))
+                if v >= target:
+                    break
+            d += step
+    reach = [o for o in options if o[1] >= target]
+    if reach:
+        fwd = min((o for o in reach if o[0] > 0), default=None)
+        back = max((o for o in reach if o[0] < 0), default=None)
+        return fwd if fwd and (back is None or fwd[0] <= -back[0] + 0.03) else back
+    if not options:
+        return None
+    d, v = max(options, key=lambda o: (o[1], -abs(o[0])))
+    return (d, v) if v >= start + resolution else None
+
+
+def _turned(points, angle):
+    """Points (robot frame) as seen by the robot after it has turned by angle."""
+    c, s = math.cos(angle), math.sin(angle)
+    return np.column_stack((c * points[:, 0] + s * points[:, 1], -s * points[:, 0] + c * points[:, 1]))
+
+
+def free_ahead(points, half_length, half_width, turn=0.0):
+    """Free distance (m) in front of the robot's front edge after turning by `turn`: the nearest of the points
+    (robot frame, e.g. LiDAR hits) in the strip the robot's width sweeps forward. inf if none."""
+    p = _turned(points, turn)
+    ahead = p[(p[:, 0] > 0) & (np.abs(p[:, 1]) <= half_width), 0]
+    return max(0.0, float(ahead.min()) - half_length) if ahead.size else float('inf')
+
+
+def rotation_clear(points, half_length, half_width, turn, step=math.radians(3)):
+    """True if turning in place by `turn` (rad) sweeps the robot's rectangle past none of the points."""
+    for a in np.linspace(0.0, turn, max(2, int(abs(turn) / step) + 2)):
+        p = _turned(points, a)
+        if np.any((np.abs(p[:, 0]) <= half_length) & (np.abs(p[:, 1]) <= half_width)):
+            return False
+    return True
+
+
 def order_nearest_neighbour(start_xy, points):
     """Greedy nearest-neighbour tour starting from start_xy."""
     remaining = list(points)

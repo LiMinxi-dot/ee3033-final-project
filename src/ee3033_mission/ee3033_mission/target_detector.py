@@ -47,6 +47,7 @@ class TargetDetector(Node):
         self.declare_parameter('conf_threshold', 0.45)
         self.declare_parameter('imgsz', 320)
         self.declare_parameter('max_rate', 10.0)
+        self.declare_parameter('num_threads', 2)                 # PyTorch CPU threads, 0 = all cores
         self.declare_parameter('debug_image', True)
         self.declare_parameter('debug_rate', 2.0)
 
@@ -60,6 +61,9 @@ class TargetDetector(Node):
 
         model_path = self.ensure_model(p('model_path'))
         from ultralytics import YOLO  # heavy import, keep it after the parameters are logged
+        if int(p('num_threads')) > 0:
+            import torch
+            torch.set_num_threads(int(p('num_threads')))     # leave cores for Nav2 and AMCL
         self.get_logger().info(f'Loading YOLO model {model_path} (imgsz={self.imgsz})')
         self.model = YOLO(model_path, task='detect')
         names = self.model.names  # {id: name}

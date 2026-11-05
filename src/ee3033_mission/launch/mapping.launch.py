@@ -47,13 +47,17 @@ def generate_launch_description():
                                              LaunchConfiguration('explorer'), f"' == '{name}'"]))
     ours, lite = explore_with('ee3033'), explore_with('lite')
     params = os.path.join(get_package_share_directory('ee3033_mission'), 'config', 'mission.yaml')
-    # As balance_mapping_slamtoolbox_async.launch.py, but ignoring LiDAR hits closer than 7.5 cm: part of the robot
-    # right behind the LiDAR shows up 4-5 cm away in every scan, and SLAM marked it as an obstacle wherever the
-    # robot paused (a trail of dots; one at the start made the start unreachable for Nav2).
+    # As balance_mapping_slamtoolbox_async.launch.py, but ignoring LiDAR hits closer than 13 cm: part of the robot
+    # behind the LiDAR shows up in every scan (below 6.5 cm, and now and then at 7.5-12 cm), and SLAM marked it as an
+    # obstacle wherever the robot paused (a trail of dots; one at the start made the start unreachable for Nav2).
     slam = Node(package='slam_toolbox', executable='async_slam_toolbox_node', name='slam_toolbox', output='screen',
                 parameters=[os.path.join(get_package_share_directory('balance_mapping'), 'config',
                                          'mapper_params_online_async.yaml'),
-                            {'use_sim_time': False, 'min_laser_range': 0.075}])
+                            {'use_sim_time': False, 'min_laser_range': 0.13,
+                             # a cell is a wall if > this share of the rays reaching it end there (default 0.1):
+                             # a thin wall mostly seen along its length (rays grazing past it in its cell) was
+                             # mapped as free space but for 1-2 cells
+                             'occupancy_threshold': 0.05}])
     watchdog = Node(package='ee3033_mission', executable='cmd_vel_watchdog', output='screen', parameters=[params])
     mapper = Node(package='ee3033_mission', executable='auto_mapper', output='screen', condition=ours,
                   parameters=[params, {'auto_start': LaunchConfiguration('auto_start')}])
@@ -63,7 +67,7 @@ def generate_launch_description():
                    parameters=[{'target_frame': 'map', 'source_frame': 'base_footprint'}])
     after_slam = RegisterEventHandler(OnProcessExit(target_action=wait_tf, on_exit=[
         LogInfo(msg='[ee3033] SLAM is publishing map -> base_footprint: starting Nav2'),
-        include('balance_navigation', 'balance_nav2_core.launch.py'),
+        include('ee3033_mission', 'nav2.launch.py'),
         mapper,
         TimerAction(period=5.0, actions=[include('balance_mapping', 'balance_explorer_lite.launch.py', lite)]),
     ]))
