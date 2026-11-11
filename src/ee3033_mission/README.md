@@ -14,6 +14,7 @@ It uses the vendor packages on the car (`balance_robot_base`, `lslidar_driver_n1
 | `mission_manager` | `/map`, `/target/estimate`, TF, Nav2 actions `navigate_to_pose` and `spin` | `/initialpose`, `/mission/state`, `/mission/target` (`PointStamped`), `/mission/viewpoints`, result YAML |
 | `cmd_vel_watchdog` | `/cmd_vel_teleop` | `/cmd_vel` (speed-limited; stop 0.6 s after the last command) |
 | `auto_mapper` | `/map` (SLAM Toolbox), TF, Nav2 action `navigate_to_pose` | `/explore/state`, `/explore/frontiers`, map files |
+| `odom_scaler` | `/odom_raw` (the base, with `odom_yaw_scale*` != 1) | `/odom`, TF `odom_combined -> base_footprint` with the base's left / right turns scaled |
 
 Services: `/mission/start`, `/mission/stop` (`std_srvs/Trigger`), `/target_localizer/reset` (`std_srvs/Empty`),
 `/explore/start`, `/explore/stop`, `/explore/save_map` (`std_srvs/Trigger`).
@@ -21,6 +22,9 @@ Services: `/mission/start`, `/mission/stop` (`std_srvs/Trigger`), `/target_local
 Tools:
 - `ros2 run ee3033_mission setup_check [--computer]`: checks the course packages, devices, YOLO and network settings.
 - `ros2 run ee3033_mission camera_lidar_check`: measures `camera_offset_yaw_deg` from camera vs LiDAR bearings of one object and saves an overlay image.
+- `ros2 run ee3033_mission odom_turn_test [--ros-args -p go:=true]`: turns in place (by `/odom`) and aligns the LiDAR
+  scans from before and after each turn: true / odometry turn per direction, i.e. `odom_yaw_scale` / `odom_yaw_scale_cw`
+  (with `odom_scaler` on it should give 1.000). Dry run without `go:=true`; base and LiDAR only, no Nav2.
 All tunable values are in `config/mission.yaml`.
 
 ## Autonomous mapping (auto_mapper)
