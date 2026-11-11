@@ -2,8 +2,9 @@
 
 It provides the parameters, the robot pose from TF, the latched /map, the
 <ns>/state topic, the <ns>/start and <ns>/stop services, one Nav2 action at a
-time (with timeout and cancel), the WAIT_SYSTEM readiness check and the return
-to the home pose. Subclasses implement begin() and tick().
+time (with timeout and cancel), our own straight moves where Nav2 does not move
+the robot (start_drive, start_escape), the WAIT_SYSTEM readiness check and the
+return to the home pose. Subclasses implement begin() and tick().
 """
 
 import math
@@ -27,10 +28,12 @@ from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from .exploration import plan_route
-from .geometry import (escape_move, free_ahead, rotation_clear, scan_to_points, transform_to_xyyaw, wall_sdf,
-                       world_to_grid, wrap_angle, yaw_to_quaternion)
+from .geometry import (escape_move, free_ahead, line_min_sdf, rotation_clear, scan_to_points, transform_to_xyyaw,
+                       wall_sdf, world_to_grid, wrap_angle, yaw_to_quaternion)
 from .scan_match import transform
 from .ros_helpers import LATCHED
+
+SMOOTHER_DECEL = (0.3, 1.0)           # m/s2, rad/s2: the velocity smoother's max_decel (nav2.launch.py)
 
 
 class NavStateNode(Node):
@@ -39,13 +42,23 @@ class NavStateNode(Node):
         super().__init__(name)
         params = {'global_frame': 'map', 'robot_frame': 'base_footprint', 'auto_start': False,
                   'nav_timeout': 30.0, 'home_retries': 2, 'home_tolerance': 0.25,
+                  'home_heading': True,         # at home, turn in place (Nav2 spin) to the start heading; False:
+                                                # as the last leg (DWB's own turn at home took 9-12 s for ~170 deg)
+                  'home_yaw_tolerance_deg': 5.0,  # ... turn again while further off (odometry over-turns 4-6 %)
                   'stuck_time': 8.0,            # s; a Nav2 goal during which the robot moves less than stuck_move
-                  'stuck_move': 0.05,           # m  ... ends: reached if within stuck_accept, else failed
-                  'stuck_accept': 0.20,         # m
+                  'stuck_move': 0.08,           # m  ... ends: reached if within stuck_accept, else failed (then
+                  'stuck_accept': 0.20,         # m  start_drive or start_escape)
                   'leg_skip': 0.15,             # m; a route leg whose waypoint is this close already is skipped
+                  'leg_pass': 0.15,             # m; this close to a route waypoint that is not the last, the next
+                                                # leg is sent at once (see _check_leg_pass); 0 = off
                   'route_clearance': 0.15, 'route_max_leg': 0.8, 'turn_first_deg': 45.0,
                   'scan_topic': '/scan_fixed',
                   'scan_min_range': 0.13,       # m; closer LiDAR hits are the robot itself (up to 12 cm behind it)
+                  'drive': False,               # Nav2 does not move the robot: drive the leg ourselves if the
+                  'drive_speed': 0.10,          # m/s     LiDAR shows it free (see start_drive)
+                  'drive_turn_speed': 0.5,      # rad/s, as the Nav2 spin
+                  'drive_stop': 0.05,           # m of LiDAR-free space ahead of the robot's front edge to keep
+                  'drive_steer_gain': 1.5,      # rad/s per rad of heading error to the leg's end
                   'escape': True,               # move away from a wall Nav2 cannot leave (see start_escape)
                   'escape_trigger': 0.11,       # m from the map walls; Nav2's inscribed zone: robot_radius 0.10 + 0.01
                   'escape_target': 0.14,
@@ -81,13 +94,14 @@ class NavStateNode(Node):
         self.create_subscription(LaserScan, self.cfg['scan_topic'], lambda m: setattr(self, 'scan', m),
                                  qos_profile_sensor_data)
         self.sdf = None               # (map_count, wall_sdf of /map)
-        self.escaping = None          # the escape move being driven (start_escape)
+        self.own_move = None          # our own move being driven (start_drive, start_escape)
         self.create_service(Trigger, f'/{ns}/start', self.on_start)
         self.create_service(Trigger, f'/{ns}/stop', self.on_stop)
 
         self.t_start = None
         self.home = None
         self.home_attempts = 0
+        self.home_turns = 0
         self.route = None             # legs of the route being driven (send_route)
         self.goal_handle = None
         self.goal_rejected = False
@@ -116,9 +130,9 @@ class NavStateNode(Node):
         except TransformException:
             return None
 
-    def map_grid(self):
-        """The last /map as a 2-D int array (row = y), its resolution and origin (x, y)."""
-        m = self.map
+    def map_grid(self, msg=None):
+        """The last /map (or msg) as a 2-D int array (row = y), its resolution and origin (x, y)."""
+        m = msg or self.map
         grid = np.array(m.data, dtype=np.int16).reshape(m.info.height, m.info.width)
         return grid, m.info.resolution, (m.info.origin.position.x, m.info.origin.position.y)
 
@@ -193,9 +207,11 @@ class NavStateNode(Node):
     def _send_pending(self):
         """Send the pending goal, but not within 1 s of cancelling one: Nav2 also drops a goal that arrives
         while it is still cancelling the previous one, and the new goal comes back as failed."""
-        if self.pending_goal is None or time.time() - self.last_cancel < 1.0:
+        if self.pending_goal is None:
             return
         client, goal, seq = self.pending_goal
+        if client is self.nav and time.time() - self.last_cancel < 1.0:
+            return
         self.pending_goal = None
         if seq == self.action_seq:
             client.send_goal_async(goal).add_done_callback(lambda f: self._on_goal_response(f, seq))
@@ -232,8 +248,8 @@ class NavStateNode(Node):
         self.action_seq += 1          # results of the old goal are ignored from now on
         self.action_done_cb, self.action_deadline, self.pending_goal, self.watch = None, None, None, None
         self.route = None
-        if self.escaping is not None:
-            self.escaping = None
+        if self.own_move is not None:
+            self.own_move = None
             self.pub_nav_cmd.publish(Twist())
         self._cancel_goal()
 
@@ -249,20 +265,44 @@ class NavStateNode(Node):
         If the way there (towards via, by default the first waypoint of plan_route) starts more than
         turn_first_deg off the robot's heading, the robot first turns in place (Nav2 spin, no forward
         speed). DWB turned around in a forward arc instead, and twice the robot drove into the wall it
-        stood next to when the next goal was behind it. Before that, a robot too close to a map wall for Nav2
-        first moves away from it (start_escape); if the goal fails and the robot has got there meanwhile (e.g.
-        drifted while turning), it moves away and the goal is sent once more.
+        stood next to when the next goal was behind it.
+        Where Nav2 does not move the robot, the LiDAR decides whether it is really stuck: next to a map wall
+        (closer than escape_trigger: Nav2 neither plans nor turns there), and after a failed or stalled goal
+        (_check_stuck), the robot drives straight to (x, y) itself if the LiDAR shows the way free (start_drive;
+        legs are straight). Else, or if the drive stops short, it moves away from the wall (start_escape) and the
+        goal is sent once more.
         """
         def retry():
             self.send_nav(x, y, yaw, on_done, via, escaped=True)
 
-        if not escaped and self.start_escape(retry):
+        def driven(ok):
+            if ok:
+                on_done(True)
+            elif escaped or not self.start_escape(retry):
+                on_done(False)
+
+        def own_move():
+            return self.start_drive(x, y, driven) or (not escaped and self.start_escape(retry))
+
+        if not escaped and self.wall_distance() < float(self.cfg['escape_trigger']) and own_move():
             return
         goal = NavigateToPose.Goal()
         goal.pose = self.make_pose(x, y, yaw)
+        resends = [0]
 
         def done(success):
-            if success or escaped or not self.start_escape(retry):
+            pose = self.robot_pose()
+            off = math.hypot(pose[0] - x, pose[1] - y) if pose is not None else 0.0
+            if success and off > float(self.cfg['stuck_accept']) and resends[0] < 2:
+                # Nav2 reported a goal reached the robot is far from: a result of the path before a preemption
+                # (the controller reached the old leg's end 0.1-0.8 s after the next leg was sent, 11-11), or
+                # "Reached the goal!" while the map->odom TF was too old at the start of mapping (11-11).
+                resends[0] += 1
+                self.get_logger().warn(f'Nav2 reported the goal reached, but the robot is {off:.2f} m from it: '
+                                       f'sending it again')
+                drive()
+                return
+            if success or self.goal_rejected or not own_move():
                 on_done(success)
 
         def drive(turned=True):
@@ -299,6 +339,37 @@ class NavStateNode(Node):
         turn = float(wrap_angle(math.atan2(via[1] - pose[1], via[0] - pose[0]) - pose[2]))
         return turn if abs(turn) > limit else None
 
+    def _check_leg_pass(self):
+        """Within leg_pass of a route waypoint that is not the last one, send the next leg at once: Nav2 preempts
+        the leg's goal and the robot drives on. Waiting for Nav2 to reach each waypoint (slow down, DWB's turn to
+        the goal heading, the goal checker) took 3-8 s per leg (runs 11-06 and 11-11), ~25 % of the exploration.
+        Only where the straight line from the robot to the next waypoint keeps route_clearance from the map walls
+        (the legs were planned from the waypoint, not from here) and the robot is clear of the walls (no escape).
+        A turn of more than turn_first_deg still stops the robot: the leg's goal is cancelled for the spin."""
+        r, w, limit = self.route, self.watch, float(self.cfg['leg_pass'])
+        if limit <= 0 or not r or len(r['legs']) < 2 or self.own_move is not None or \
+                tuple(w['xy']) != tuple(r['legs'][0]):
+            return
+        pose = self.robot_pose()
+        if pose is None or self.map is None:
+            return
+        d = math.hypot(pose[0] - w['xy'][0], pose[1] - w['xy'][1])
+        if d > limit:
+            return
+        grid, res, origin, sdf = self.map_sdf()
+        if line_min_sdf(sdf, res, origin, pose[:2], r['legs'][1]) < float(self.cfg['route_clearance']) or \
+                self.wall_distance(pose) < float(self.cfg['escape_trigger']):
+            return
+        self.get_logger().info(f'Leg {r["total"] - len(r["legs"]) + 1}/{r["total"]} passed {d:.2f} m from its '
+                               f'waypoint; next leg without stopping')
+        self.action_seq += 1          # the leg's goal ends as aborted (preempted): ignored
+        self.action_done_cb, self.action_deadline, self.watch = None, None, None
+        x, y = r['legs'][1]
+        if self.turn_first(x, y, via=(x, y)) is not None:
+            self._cancel_goal()       # the spin must not run against DWB
+        r['legs'].pop(0)
+        self._next_leg()
+
     def _check_stuck(self):
         """End a Nav2 goal during which the robot has moved less than stuck_move for stuck_time s: reached if it
         is within stuck_accept of the goal, else failed (the caller may escape and retry). On site the robot stood
@@ -320,7 +391,71 @@ class NavStateNode(Node):
         self._cancel_goal()
         self._finish_action(seq, reached)
 
-    # ---------------------------------------------------------------- escape from walls
+    # ---------------------------------------------------------------- own moves: drive, escape from walls
+    def map_sdf(self):
+        """The last /map as map_grid() plus its wall_sdf (cached per map)."""
+        grid, res, origin = self.map_grid()
+        if self.sdf is None or self.sdf[0] != self.map_count:
+            self.sdf = (self.map_count, wall_sdf(grid, res))
+        return grid, res, origin, self.sdf[1]
+
+    def wall_distance(self, pose=None):
+        """Distance (m) of the robot from the map walls (negative inside one); inf without map or pose."""
+        pose = pose or self.robot_pose()
+        if self.map is None or pose is None:
+            return float('inf')
+        _, res, origin, sdf = self.map_sdf()
+        row, col = world_to_grid(pose[0], pose[1], origin, res)
+        return float(sdf[row, col]) if 0 <= row < sdf.shape[0] and 0 <= col < sdf.shape[1] else float('inf')
+
+    def start_drive(self, x, y, then):
+        """Drive to (x, y) ourselves where Nav2 does not: turn in place to face it, then straight there at
+        drive_speed, steering towards it, through the velocity smoother. then(success) is called once. True if
+        the move started.
+
+        The map draws walls 2-3 cells thick (site 11-05: the map wall under the robot's centre, the real wall 5-8 cm
+        away), so the robot often stands in Nav2's inscribed zone ("Starting point in lethal space") or Nav2 stalls
+        next to a wall while the way is clear. The LiDAR decides: the move starts only if the turn is free for the
+        robot's corners (behind it, where the LiDAR is blind, the map must be free: rear_free), the strip its width
+        sweeps is free of LiDAR hits up to drive_stop beyond (x, y), and the line crosses no map wall cell (none
+        deeper than the robot's own, if AMCL puts it into one): how close it passes the blurred map walls is left to
+        the LiDAR. While driving, a LiDAR hit within drive_stop ahead stops it.
+        """
+        c = self.cfg
+        pose = self.robot_pose()
+        if not c['drive'] or self.map is None or pose is None:
+            return False
+        points = self.body_points()
+        dist = math.hypot(x - pose[0], y - pose[1])
+        if points is None or dist < 0.05:
+            return False
+        grid, res, origin, sdf = self.map_sdf()
+        here = self.wall_distance(pose)
+        if line_min_sdf(sdf, res, origin, pose[:2], (x, y)) < min(here, res) - res / 2:
+            self.get_logger().warn(f'Drive: the line to ({x:.2f}, {y:.2f}) crosses a map wall; not driving')
+            return False
+        hl, hw = self.body_box()
+        turn = float(wrap_angle(math.atan2(y - pose[1], x - pose[0]) - pose[2]))
+        if abs(turn) < math.radians(10):
+            turn = 0.0
+        elif not (rotation_clear(points, hl, hw, turn) and self.rear_free(pose, sdf, res, origin)):
+            self.get_logger().warn(f'Drive: turning {math.degrees(turn):+.0f} deg towards ({x:.2f}, {y:.2f}) is not '
+                                   'free; not driving')
+            return False
+        free = free_ahead(points, hl, hw, turn)
+        if free < dist + float(c['drive_stop']):
+            self.get_logger().warn(f'Drive: LiDAR hit {free:.2f} m ahead on the {dist:.2f} m to ({x:.2f}, {y:.2f}): '
+                                   'really blocked')
+            return False
+        segments = (([('turn', turn, float(c['drive_turn_speed']))] if turn else [])
+                    + [('goto', (float(x), float(y)), float(c['drive_speed']))])
+        self.get_logger().warn(f'Drive: {here:.2f} m from the map walls, the LiDAR shows the way to ({x:.2f}, {y:.2f}) '
+                               f'free ({free:.2f} m ahead): driving there ourselves, '
+                               + (f'turning {math.degrees(turn):+.0f} deg, then ' if turn else '') + f'{dist:.2f} m')
+        self.own_move = {'label': 'Drive', 'segments': segments, 'i': 0, 'start': None, 'stop_at': None,
+                         'abort': False, 'then': then, 'done': []}
+        return True
+
     def start_escape(self, then):
         """Before a Nav2 goal: if the robot stands within escape_trigger of the map walls, move it to where Nav2
         can plan from, then call then(). True if a move started.
@@ -340,14 +475,8 @@ class NavStateNode(Node):
         pose = self.robot_pose()
         if not c['escape'] or self.map is None or pose is None:
             return False
-        grid, res, origin = self.map_grid()
-        if self.sdf is None or self.sdf[0] != self.map_count:
-            self.sdf = (self.map_count, wall_sdf(grid, res))
-        sdf = self.sdf[1]
-        row, col = world_to_grid(pose[0], pose[1], origin, res)
-        if not (0 <= row < sdf.shape[0] and 0 <= col < sdf.shape[1]):
-            return False
-        here = float(sdf[row, col])
+        grid, res, origin, sdf = self.map_sdf()
+        here = self.wall_distance(pose)
         if here >= float(c['escape_trigger']):
             return False
         points = self.body_points()
@@ -380,12 +509,13 @@ class NavStateNode(Node):
                                    'here); no straight move gets it clear and no turn is free of LiDAR hits')
             return False
         turn, (d, clear) = plan
-        segments = ([('turn', turn)] if turn else []) + [('drive', d)]
+        segments = (([('turn', turn, float(c['escape_turn_speed']))] if turn else [])
+                    + [('drive', d, float(c['escape_speed']))])
         self.get_logger().warn(f'Escape: the robot is {here:.2f} m from the map walls; '
                                + (f'turning {math.degrees(turn):+.0f} deg, then ' if turn else '')
                                + f'driving {abs(d):.2f} m {"forward" if d > 0 else "backward"} ({clear:.2f} m there)')
-        self.escaping = {'segments': segments, 'i': 0, 'start': None, 'stop_at': None, 'abort': False,
-                         'then': then, 'done': []}
+        self.own_move = {'label': 'Escape', 'segments': segments, 'i': 0, 'start': None, 'stop_at': None,
+                         'abort': False, 'then': lambda ok: then(), 'done': []}
         return True
 
     def body_box(self):
@@ -423,8 +553,8 @@ class NavStateNode(Node):
                 return False
         return True
 
-    def _escape_step(self):
-        e, now = self.escaping, time.time()
+    def _own_move_step(self):
+        e, now = self.own_move, time.time()
         if e['stop_at'] is not None:                   # between segments: the smoother ramps down, the robot settles
             self.pub_nav_cmd.publish(Twist())
             if now - e['stop_at'] < 0.6:
@@ -432,35 +562,49 @@ class NavStateNode(Node):
             e['stop_at'], e['start'] = None, None
             e['i'] += 1
             if e['abort'] or e['i'] >= len(e['segments']):
-                self.escaping = None
-                self.get_logger().warn('Escape: ' + ', '.join(e['done']))
-                e['then']()
+                self.own_move = None
+                self.get_logger().warn(f"{e['label']}: " + ', '.join(e['done']))
+                e['then'](not e['abort'])
                 return
-        kind, amount = e['segments'][e['i']]
+        kind, amount, speed = e['segments'][e['i']]
         pose = self.robot_pose()
         if pose is None:
             e['done'].append(f'{kind} stopped: no pose')
             e['abort'], e['stop_at'] = True, now
             return
         if e['start'] is None:
-            speed = float(self.cfg['escape_turn_speed'] if kind == 'turn' else self.cfg['escape_speed'])
-            e['start'], e['deadline'] = pose, now + abs(amount) / speed + 4.0
+            length = math.hypot(amount[0] - pose[0], amount[1] - pose[1]) * 1.5 if kind == 'goto' else abs(amount)
+            e['start'], e['deadline'] = pose, now + length / speed + 4.0
         x0, y0, yaw0 = e['start']
         points = self.body_points()
         hl, hw = self.body_box()
+        brake = speed ** 2 / (2 * SMOOTHER_DECEL[kind == 'turn'])     # stop command -> standing still
         cmd = Twist()
         if kind == 'turn':
             progress = abs(float(wrap_angle(pose[2] - yaw0)))
-            blocked = points is None or not rotation_clear(points, hl, hw, math.copysign(math.radians(5), amount))
-            finished = progress >= abs(amount) - 0.03
-            cmd.angular.z = math.copysign(float(self.cfg['escape_turn_speed']), amount)
+            ahead = math.copysign(max(math.radians(5), speed * 0.3), amount)
+            blocked = points is None or not rotation_clear(points, hl, hw, ahead)
+            finished = progress >= abs(amount) - max(0.03, brake)
+            cmd.angular.z = math.copysign(speed, amount)
             text = f'turned {math.degrees(progress):.0f} deg'
-        else:
+        elif kind == 'drive':
             progress = abs((pose[0] - x0) * math.cos(yaw0) + (pose[1] - y0) * math.sin(yaw0))
             blocked = amount > 0 and (points is None or free_ahead(points, hl, hw) <= 0.0)
-            finished = progress >= abs(amount) - 0.005
-            cmd.linear.x = math.copysign(float(self.cfg['escape_speed']), amount)
+            finished = progress >= abs(amount) - max(0.005, brake)
+            cmd.linear.x = math.copysign(speed, amount)
             text = f'drove {progress:.2f} m {"forward" if amount > 0 else "backward"}'
+        else:                                          # goto: straight to amount = (x, y), steering towards it
+            gx, gy = amount
+            length = max(math.hypot(gx - x0, gy - y0), 1e-6)
+            progress = ((pose[0] - x0) * (gx - x0) + (pose[1] - y0) * (gy - y0)) / length
+            left = math.hypot(gx - pose[0], gy - pose[1])
+            blocked = points is None or free_ahead(points, hl, hw) <= float(self.cfg['drive_stop'])
+            finished = progress >= length - max(0.005, brake) or left <= 0.03
+            err = float(wrap_angle(math.atan2(gy - pose[1], gx - pose[0]) - pose[2])) if left > 0.08 else 0.0
+            turn_cap = float(self.cfg['drive_turn_speed'])
+            cmd.angular.z = max(-turn_cap, min(turn_cap, float(self.cfg['drive_steer_gain']) * err))
+            cmd.linear.x = speed if abs(err) < math.radians(30) else 0.0
+            text = f'drove {progress:.2f} of {length:.2f} m to ({gx:.2f}, {gy:.2f})'
         if finished or blocked or now > e['deadline']:
             if not finished:
                 text += ' (stopped: LiDAR hit)' if blocked else ' (stopped: timeout)'
@@ -473,7 +617,8 @@ class NavStateNode(Node):
 
     # ---------------------------------------------------------------- routes
     def send_route(self, x, y, yaw, on_done, label):
-        """Drive to (x, y, yaw) in short straight legs along corridor centres (exploration.plan_route).
+        """Drive to (x, y, yaw) in short straight legs along corridor centres (exploration.plan_route); yaw None:
+        any heading at the end.
 
         At each corner the robot first turns in place to face the next leg. One long goal through a maze
         often failed: the controller got stuck at the U-turns ("Failed to make progress"), while the short
@@ -509,7 +654,12 @@ class NavStateNode(Node):
             r['done'](True)
             return
         x, y = r['legs'][0]
-        yaw = r['yaw'] if len(r['legs']) == 1 else math.atan2(r['legs'][1][1] - y, r['legs'][1][0] - x)
+        if len(r['legs']) > 1:
+            yaw = math.atan2(r['legs'][1][1] - y, r['legs'][1][0] - x)
+        elif r['yaw'] is not None:
+            yaw = r['yaw']
+        else:                         # any heading at the end: keep the one the robot arrives with
+            yaw = math.atan2(y - pose[1], x - pose[0]) if pose is not None else 0.0
         self.get_logger().info(f'Leg {r["total"] - len(r["legs"]) + 1}/{r["total"]} -> ({x:.2f}, {y:.2f})')
         self.send_nav(x, y, yaw, self._on_leg, via=(x, y))       # legs are straight
 
@@ -536,8 +686,8 @@ class NavStateNode(Node):
     def go_home(self):
         """Route home from where the robot is now (a failed attempt replans from there)."""
         self.home_attempts += 1
-        x, y, yaw = self.home
-        self.send_route(x, y, yaw, self.on_home_result,
+        x, y, _ = self.home
+        self.send_route(x, y, None, self.on_home_result,         # the start heading: turn_home
                         f'Returning home to ({x:.2f}, {y:.2f}), attempt {self.home_attempts}')
 
     def on_home_result(self, success):
@@ -546,8 +696,8 @@ class NavStateNode(Node):
         if success or dist <= float(self.cfg['home_tolerance']):
             self.stop_robot()
             self.get_logger().info(f'Home reached ({dist:.2f} m from start) after {time.time() - self.t_start:.1f}s')
-            self.on_home_reached()
-            self.set_state('DONE')
+            self.home_turns = 0
+            self.turn_home()
         elif self.home_attempts <= int(self.cfg['home_retries']):
             self.go_home()
         else:
@@ -555,16 +705,42 @@ class NavStateNode(Node):
             self.get_logger().error(f'Could not return home ({dist:.2f} m away)')
             self.set_state('FAILED')
 
+    def turn_home(self, turned=True):
+        """With home_heading, turn in place (Nav2 spin) until the robot faces the start heading within
+        home_yaw_tolerance_deg (at most 3 turns: the odometry over-turns 4-6 %), so it is ready for the next run
+        without being turned by hand. Then DONE."""
+        if self.state != 'RETURN':
+            return
+        pose = self.robot_pose()
+        err = float(wrap_angle(self.home[2] - pose[2])) if pose is not None else 0.0
+        tol = math.radians(float(self.cfg['home_yaw_tolerance_deg']))
+        if self.cfg['home_heading'] and abs(err) > tol and self.home_turns < 3 and self.spin.server_is_ready():
+            self.home_turns += 1
+            spin = Spin.Goal()
+            spin.target_yaw = err
+            spin.time_allowance.sec = 15
+            self.get_logger().info(f'Turning {math.degrees(err):.0f} deg in place to the start heading')
+            self.run_action(self.spin, spin, 18.0, self.turn_home)
+            return
+        self.stop_robot()
+        if self.cfg['home_heading']:
+            self.get_logger().info(f'Home heading {math.degrees(err):+.1f} deg off the start heading'
+                                   + ('' if turned else ' (last turn failed, e.g. "Collision Ahead")'))
+        self.on_home_reached()
+        self.set_state('DONE')
+
     def on_home_reached(self):
         pass
 
     # ---------------------------------------------------------------- tick
     def _tick(self):
         self._send_pending()
-        if self.escaping is not None:
-            self._escape_step()
+        if self.own_move is not None:
+            self._own_move_step()
         if self.watch is not None and self.action_done_cb is not None:
             self._check_stuck()
+        if self.watch is not None and self.action_done_cb is not None:
+            self._check_leg_pass()
         if self.action_deadline is not None and time.time() > self.action_deadline:
             self.get_logger().warn('Action timed out; cancelling')
             self._cancel_goal()

@@ -18,6 +18,9 @@ file rewritten (the vendor package stays unchanged):
   to 0.15 m short or beside its waypoint; on site the offsets added up in a 0.37 m passage until the robot stood at
   a wall corner (twice, same corner: stuck once, scraped once). 0.08 was too tight: the swaying robot hovered
   0.06-0.10 m from the goal, the progress checker aborted ("Failed to make progress") and legs took 30-60 s.
+  DWB's own xy_goal_tolerance 0.15 -> 0.10: within it DWB's RotateToGoal critic allows only turning, no driving.
+  With 0.15 against the checker's 0.12 nobody drove the last 3 cm and the swaying robot hovered at the leg end until
+  a sway took it inside 0.12 m (site mapping 11-06: 0.5-6 s per leg, 15 s once). Below the checker's, DWB drives in.
   obstacle_min_range 0 -> 0.13 (both costmaps), as min_laser_range for SLAM: the robot's own body is in every
   scan below 6.5 cm (rear +-28 deg), and ~0.14 returns per scan lie at 7.5-12 cm behind it (rear 12-24 deg off
   the axis). Points the costmap marks there are never cleared (the body blocks the beams that would clear them):
@@ -27,7 +30,9 @@ file rewritten (the vendor package stays unchanged):
   Slower (site mapping run: walls 2-4 cells thick and blurred): DWB max_vel_x 0.25 / max_speed_xy 0.2 -> 0.10 m/s
   (0.15 at first: on the long straight legs home the robot then went twice as fast as while exploring, where legs
   are short, and the map got distorted), max_vel_theta 1.2 -> 0.5 rad/s; spin behaviour max_rotational_vel
-  1.0 -> 0.5 rad/s. Turning smears a scan most (the robot turns during the ~0.1 s a scan takes).
+  1.0 -> 0.5 rad/s. Turning smears a scan most (the robot turns during the ~0.1 s a scan takes). The speed is the
+  launch argument max_speed (DWB and the smoother): 0.125 while mapping (mapping.launch.py; 0.10 until 11-06, when
+  the spread of the wall hits turned out not to depend on the speed) and in the mission (mission.launch.py).
   Velocity smoother (between the controller / behaviours and the base, OPEN_LOOP: limits the change of the
   command itself, not affected by the swaying odometry): accel 1.0 -> 0.2 m/s2 and 2.0 -> 1.0 rad/s2, decel
   -1.0 -> -0.3 m/s2 and -2.0 -> -1.0 rad/s2 (0 -> 0.15 m/s in 0.15 s made the balancing robot lurch and tilt);
@@ -56,8 +61,9 @@ import tempfile
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import GroupAction, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import SetParameter, SetRemap
 
 DWB = 'controller_server.ros__parameters.FollowPath.'
@@ -66,9 +72,8 @@ OVERRIDES = {                             # path in the vendor file -> value; no
     'robot_radius': 0.10,                 # both costmaps
     'obstacle_min_range': 0.13,           # the scan source of both costmaps (robot body returns reach 12 cm)
     DWB + 'min_vel_x': 0.0,
-    DWB + 'max_vel_x': 0.10,
-    DWB + 'max_speed_xy': 0.10,
     DWB + 'max_vel_theta': 0.5,
+    DWB + 'xy_goal_tolerance': 0.10,      # below the goal checker's 0.12 (see above)
     'behavior_server.ros__parameters.max_rotational_vel': 0.5,
     'behavior_server.ros__parameters.rotational_acc_lim': 1.0,
     'controller_server.ros__parameters.progress_checker.required_movement_radius': 0.1,
@@ -88,8 +93,6 @@ OVERRIDES = {                             # path in the vendor file -> value; no
         'use_final_approach_orientation': False,
         'smoother': {'max_iterations': 1000, 'w_smooth': 0.3, 'w_data': 0.2, 'tolerance': 1.0e-10},
     },
-    SMOOTHER + 'max_velocity': [0.10, 0.0, 0.5],     # x, y, theta
-    SMOOTHER + 'min_velocity': [-0.10, 0.0, -0.5],
     SMOOTHER + 'max_accel': [0.2, 0.0, 1.0],
     SMOOTHER + 'max_decel': [-0.3, 0.0, -1.0],
 }
@@ -120,24 +123,39 @@ def rewrite(params, overrides, new=()):
     return params
 
 
+def speed_overrides(speed):
+    """Forward speed limit (m/s) of DWB and the velocity smoother."""
+    return {DWB + 'max_vel_x': speed, DWB + 'max_speed_xy': speed,
+            SMOOTHER + 'max_velocity': [speed, 0.0, 0.5],      # x, y, theta
+            SMOOTHER + 'min_velocity': [-speed, 0.0, -0.5]}
+
+
 def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument('max_speed', default_value='0.10', description='m/s, DWB and the velocity smoother'),
+        OpaqueFunction(function=nav2_actions),
+    ])
+
+
+def nav2_actions(context):
     # Our own rewrite instead of nav2_common's RewrittenYaml, which cannot write lists (the smoother limits).
+    speed = float(LaunchConfiguration('max_speed').perform(context))
     src = os.path.join(get_package_share_directory('balance_navigation'), 'config', 'nav2_core_params.yaml')
     bt = os.path.join(get_package_share_directory('ee3033_mission'), 'behavior_trees',
                       'navigate_to_pose_no_motion_recoveries.xml')
     added = {'bt_navigator.ros__parameters.default_nav_to_pose_bt_xml': bt}
     with open(src) as f:
-        params = rewrite(yaml.safe_load(f), {**OVERRIDES, **added}, new=added)
+        params = rewrite(yaml.safe_load(f), {**OVERRIDES, **speed_overrides(speed), **added}, new=added)
     with tempfile.NamedTemporaryFile('w', prefix='ee3033_nav2_', suffix='.yaml', delete=False) as f:
         yaml.safe_dump(params, f)
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('nav2_bringup'), 'launch',
                                                    'navigation_launch.py')),
         launch_arguments={'use_sim_time': 'false', 'params_file': f.name, 'use_velocity_smoother': 'false'}.items())
-    return LaunchDescription([GroupAction([
+    return [GroupAction([
         SetRemap(src='cmd_vel_nav', dst='cmd_vel'),        # as the vendor launch file
         SetRemap(src='cmd_vel_smoothed', dst='cmd_vel'),   # smoother -> base
         SetRemap(src='cmd_vel', dst='cmd_vel_nav'),        # controller and behaviours -> smoother
         SetParameter(name='bond_timeout', value=0.0),      # lifecycle manager: no bonds (see above)
         nav2,
-    ])])
+    ])]

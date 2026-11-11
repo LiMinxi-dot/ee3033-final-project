@@ -65,6 +65,7 @@ PARAMS = {
     'min_clearance': 0.15,               # m; viewpoints keep this far from walls and unknown space
     'max_viewpoints': 40,
     'spin_timeout': 25.0,
+    'home_heading': True,                # turn to the start heading at home: ready for the next run (not assessed)
     'report_unconfirmed': True,
     'result_file': '/home/ros2_ws/mission_result.yaml',
 }

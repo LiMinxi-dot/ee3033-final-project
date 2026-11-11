@@ -161,3 +161,48 @@ def calibration(verdict, min_fit=0.90, margin=0.10):
         return None, (f'another heading 20 deg or more away fits almost as well ({verdict.other_fit:.0%}): the '
                       'arena looks alike from both')
     return verdict.correction, ''
+
+
+def _nearest(ref, pts, chunk=2000):
+    """Index of the nearest ref point and its distance for every point of pts (brute force, small scans)."""
+    idx, dist = np.empty(len(pts), int), np.empty(len(pts))
+    for i in range(0, len(pts), chunk):
+        d = np.hypot(pts[i:i + chunk, None, 0] - ref[None, :, 0], pts[i:i + chunk, None, 1] - ref[None, :, 1])
+        idx[i:i + chunk] = np.argmin(d, axis=1)
+        dist[i:i + chunk] = d[np.arange(len(d)), idx[i:i + chunk]]
+    return idx, dist
+
+
+def icp_2d(ref, cur, init=(0.0, 0.0, 0.0), iters=40, max_dist=0.10):
+    """Rigid transform (x, y, yaw) that maps the scan points cur onto ref (point-to-point ICP from init), the RMS
+    distance of the matched points (m) and the share of cur points matched within max_dist."""
+    x, y, yaw = init
+    rms, share = float('inf'), 0.0
+    for _ in range(iters):
+        p = transform(cur, x, y, yaw)
+        idx, d = _nearest(ref, p)
+        ok = d < max_dist
+        if ok.sum() < 10:
+            break
+        a, b = cur[ok], ref[idx[ok]]
+        ma, mb = a.mean(axis=0), b.mean(axis=0)
+        h = (a - ma).T @ (b - mb)
+        new_yaw = math.atan2(h[0, 1] - h[1, 0], h[0, 0] + h[1, 1])
+        c, s = math.cos(new_yaw), math.sin(new_yaw)
+        nx, ny = mb[0] - (c * ma[0] - s * ma[1]), mb[1] - (s * ma[0] + c * ma[1])
+        done = abs(new_yaw - yaw) < 1e-5 and math.hypot(nx - x, ny - y) < 1e-5
+        x, y, yaw = nx, ny, new_yaw
+        rms, share = float(np.sqrt(np.mean(d[ok] ** 2))), float(ok.mean())
+        if done:
+            break
+    return (x, y, yaw), rms, share
+
+
+def scan_rotation(ref, cur, guess_yaw, search=math.radians(25), step=math.radians(0.5), cap=0.10):
+    """Rotation (rad) of the robot from the scan ref to the scan cur (both in the sensor frame, robot turning about
+    roughly the same place), searched within `search` of guess_yaw and refined by ICP; with the ICP RMS (m) and
+    matched share. For a full turn the guess is 0 and the result is the over- or under-turn."""
+    yaws = guess_yaw + np.arange(-search, search + 1e-9, step)
+    costs = [np.minimum(_nearest(ref, transform(cur, 0.0, 0.0, a))[1], cap).mean() for a in yaws]
+    (x, y, yaw), rms, share = icp_2d(ref, cur, (0.0, 0.0, float(yaws[int(np.argmin(costs))])))
+    return yaw, rms, share

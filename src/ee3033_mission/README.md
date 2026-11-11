@@ -36,9 +36,12 @@ Frontier exploration on the live SLAM Toolbox map (`ros2 launch ee3033_mission m
 4. The goal is kept until its frontier disappears (explored on the way), Nav2 fails or progress along the route stops; failed
    frontiers are blacklisted. After reaching a goal the node waits for a fresh map; a frontier that is still there
    cannot be resolved from there and is blacklisted.
-5. No reachable frontier for `finish_wait` s (or `max_duration`) → save the map, drive back to the start pose
-   (same heading, so the mission can use the map origin as initial pose). The map after the return goes to
-   `<map_file>_after_return` only: the mission keeps the one from the end of the exploration.
+5. No reachable frontier for `finish_wait` s, no `coverage_step` more free area for `coverage_timeout` s (the area
+   is complete; on site 11-06 it was after 61 s, and the next 104 s in two corners only thickened the walls from
+   8.7 to 11.2 cm), or `max_duration` → save the map, drive back to the start pose (same heading, so the mission can
+   use the map origin as initial pose). The map after the return goes to `<map_file>_after_return` only: the
+   mission keeps the one from the end of the exploration. The map with the largest free area goes to
+   `<map_file>_peak` (thinnest walls, but a wall seen only later is missing there).
 
 Before `/explore/start` the node is a dry run: it shows the frontiers and the goal it would choose but does not move.
 Offline tests on the VM: `scripts/sim_explore.py --demo` (no ROS) and `scripts/fake_world.py` (fake SLAM + Nav2).
@@ -73,11 +76,25 @@ The start pose is the map origin, because mapping starts at the start position. 
 5. Visits the viewpoints in nearest-neighbour order and spins 360° at each one, repeating the localization check
    there (warning only).
 6. Stops as soon as the target is confirmed, reports it with the last localization check (`scan_match` in the
-   result file), and navigates home.
+   result file), and navigates home. At home it turns in place (Nav2 spin) back to the start heading
+   (`home_heading`, within `home_yaw_tolerance_deg` 5°), so the robot need not be turned by hand for the next run
+   (auto_mapper does the same).
+
+Speed: `max_speed` of `mission.launch.py` and `mapping.launch.py` (0.125 m/s) sets Nav2 (DWB, velocity smoother)
+and our own straight drives. Mapping ran at 0.10 m/s until 11-06; the spread of the wall hits did not depend on the
+speed, and SLAM adds a scan every 0.1 m or 0.1 rad at any speed.
+
+LiDAR-checked drive (both nodes): the map draws walls 2-3 cells thick, so the robot often stands in Nav2's
+inscribed zone, or Nav2 stalls next to a wall, while the real way is clear. Before a Nav2 goal from closer than
+`escape_trigger` to a map wall, and after a goal that failed or stalled, the LiDAR decides whether the robot is
+really stuck: if the robot's rectangle can turn towards the leg's end and the strip its width sweeps is free of
+LiDAR hits all the way (plus `drive_stop`), and the line crosses no map wall cell, the robot drives the leg itself
+(`drive_speed`, steering towards the end, through the velocity smoother; a LiDAR hit within `drive_stop` stops it).
+Otherwise, or if that drive stops short, it escapes as below.
 
 Escape from walls (both nodes): a robot closer than `escape_trigger` to a map wall gets no help from Nav2 (Smac:
-"Starting point in lethal space", spin and back-up: "Collision Ahead"). Before every Nav2 goal, and once after a
-goal that failed, such a robot first moves (through the velocity smoother) to where the map shows `escape_target`
+"Starting point in lethal space", spin and back-up: "Collision Ahead"). When the LiDAR-checked drive is not
+possible, such a robot first moves (through the velocity smoother) to where the map shows `escape_target`
 clearance: straight forward or backward, never through a wall, forward only as far as the LiDAR shows the robot's
 rectangle (`body_half_length`, `body_half_width`) free, backward at most `escape_max_backward` (the LiDAR cannot
 see behind the robot). If that does not get it clear (e.g. it stands along the wall), it first turns in place by
@@ -85,9 +102,13 @@ the smallest angle whose sweep of its corners the LiDAR shows free. On site the 
 spin into a wall that the map shows thicker than it is and stood there until the mission gave up.
 
 Stuck goals (both nodes): a Nav2 goal during which the robot moves less than `stuck_move` for `stuck_time` s
-ends, as reached if the robot is within `stuck_accept` of it, else as failed (escape and retry as above); a route
-leg whose waypoint the robot is already within `leg_skip` of is skipped; `nav_timeout` 30 s per goal. On site
+ends, as reached if the robot is within `stuck_accept` of it, else as failed (drive or escape as above); a route
+leg whose waypoint the robot is already within `leg_skip` of is skipped; within `leg_pass` of a waypoint that is
+not the last one, the next leg is sent at once and Nav2 preempts the goal, so the robot does not stop at each
+waypoint (it still stops for a turn of more than `turn_first_deg`); `nav_timeout` 30 s per goal. On site
 the robot stood 0.14 m from two such goals while Nav2 kept replanning, until the 60 s timeout each time.
+`stuck_move` is 0.08 m: with 0.05 the swaying robot (sway + SLAM steps, ~6 cm) reset the check all the time and it
+never fired (site 11-06: 15 s at a leg end).
 
 ## Demo procedure
 
@@ -102,6 +123,24 @@ ros2 run ee3033_mission demo.sh stop      # stop the robot and all ROS nodes (al
 
 Each step first stops ROS nodes left over from earlier runs. Ctrl-C stops the robot and all nodes.
 Logs: `/tmp/ee3033_mapping.log`, `/tmp/ee3033_mission.log`. The manual steps below do the same.
+
+demo.sh turns on two corrections by default (not yet run on site, only at home and in replays of site bags):
+- odometry turn correction (`odom_yaw_scale:=0.976 odom_yaw_scale_cw:=0.956`, both steps): the base over-reports
+  left turns by ~2.5 % and right turns by ~4.5 %; `odom_turn_test` measured 0.968 / 0.958 without, 0.999 / 1.004 with it.
+- tuned AMCL (`amcl_tuned:=true`, mission only, `launch/localization.launch.py`): stronger laser model, an update every
+  5 cm / 0.05 rad. Home mission: 3.6 cm mean position error (11.4 cm with the vendor parameters).
+
+**Fallback** (the setup that ran on site in the morning of 11-11) if the robot gets lost, e.g. people in the arena
+pull AMCL away (`[loc]` warnings at the viewpoints), or the turns look wrong:
+
+```bash
+ros2 run ee3033_mission demo.sh mapping odom_yaw_scale:=1.0 odom_yaw_scale_cw:=1.0
+ros2 run ee3033_mission demo.sh mission odom_yaw_scale:=1.0 odom_yaw_scale_cw:=1.0 amcl_tuned:=false
+```
+
+Only the tuned AMCL: `demo.sh mission amcl_tuned:=false`. A map made with the turn correction works with or without
+it in the mission (the map is drawn from the LiDAR). If Nav2 does not come up (`Waiting: ... nav2_active=False` for
+more than a minute): `demo.sh stop`, then start the step again (demo.sh cleans Fast DDS shared memory first).
 
 What the mission prints and what to do:
 - `[loc] LOCALIZATION CHECK FAILED (at the start) ... turned 13 deg further RIGHT, 7 cm off (...)`: the robot is not

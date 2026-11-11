@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 from ee3033_mission.geometry import grid_to_world
-from ee3033_mission.scan_match import (best_alignment, calibration, localization_verdict, match_fraction, scan_verdict,
-                                       transform, wall_distance)
+from ee3033_mission.scan_match import (best_alignment, calibration, icp_2d, localization_verdict, match_fraction,
+                                       scan_rotation, scan_verdict, transform, wall_distance)
 
 RES, ORIGIN = 0.05, (-0.5, -0.5)
 
@@ -125,3 +125,43 @@ def test_corridor_shift_does_not_block_calibration():
     fix, why = calibration(v)
     assert fix is not None, why
     assert math.degrees(fix[2]) == pytest.approx(25, abs=1.5)
+
+
+def outline_points(n=400, seed=0):
+    """Wall points of an asymmetric room (2.0 x 1.5 m, a box in one corner) around the origin, with 5 mm noise."""
+    rng = np.random.default_rng(seed)
+    segs = [((-1.0, -0.75), (1.0, -0.75)), ((1.0, -0.75), (1.0, 0.75)), ((1.0, 0.75), (-1.0, 0.75)),
+            ((-1.0, 0.75), (-1.0, -0.75)), ((0.5, 0.3), (0.8, 0.3)), ((0.5, 0.3), (0.5, 0.75))]
+    pts = []
+    for (a, b) in segs:
+        t = rng.random(n // len(segs))[:, None]
+        pts.append(np.array(a) + t * (np.array(b) - np.array(a)))
+    return np.concatenate(pts) + rng.normal(0, 0.005, (n // len(segs) * len(segs), 2))
+
+
+def in_frame(world, x, y, yaw):
+    """World points in the frame of a sensor at (x, y, yaw)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    d = world - np.array([x, y])
+    return np.column_stack((c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]))
+
+
+def test_icp_2d_recovers_transform():
+    w = outline_points()
+    ref = in_frame(w, 0.0, 0.0, 0.0)
+    cur = in_frame(w, 0.03, -0.02, math.radians(7))
+    (x, y, yaw), rms, share = icp_2d(ref, cur, (0.0, 0.0, math.radians(5)))
+    assert math.degrees(yaw) == pytest.approx(7.0, abs=0.1)
+    assert (x, y) == pytest.approx((0.03, -0.02), abs=0.005)
+    assert share > 0.95
+
+
+def test_scan_rotation_full_turn_short():
+    # the odometry says 360 deg, the robot really turned 345.6 deg (and its LiDAR moved 1.5 cm): -14.4 deg
+    w = outline_points(seed=1)
+    ref = in_frame(w, 0.015, 0.0, 0.0)
+    true = math.radians(345.6)
+    cur = in_frame(w, 0.015 * math.cos(true), 0.015 * math.sin(true), true)
+    yaw, rms, share = scan_rotation(ref, cur, 0.0)
+    assert math.degrees(yaw) == pytest.approx(-14.4, abs=0.1)
+    assert rms < 0.01

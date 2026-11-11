@@ -14,13 +14,17 @@ EXPLORE   every replan_period: find frontiers on /map and drive to the goal of
           the node waits for a fresh /map; if the same frontier is still there
           the LiDAR cannot resolve it from there, so it is blacklisted.
           Exploration ends when no reachable frontier is left for finish_wait
-          seconds or after max_duration.
+          seconds, when the free area has not grown by coverage_step for
+          coverage_timeout seconds (the area is complete; driving on only
+          thickens the walls), or after max_duration.
 RETURN    navigates back to the start pose (same heading, so the mission in
           step 2 can use the map origin as the initial pose).
 DONE      the map from the end of EXPLORE stays in map_file.{pgm,yaml} (saved
           before the return); the map after the return goes to
           map_file_after_return.{pgm,yaml} only: on the way home the robot once
           went faster on a long straight leg, tilted, and distorted the map.
+          The map with the largest free area during EXPLORE (thinnest walls,
+          but a wall seen only later is missing) goes to map_file_peak.{pgm,yaml}.
 /explore/stop cancels the Nav2 goal and stops the robot at any time (/explore/start
 then resumes with the same home pose and blacklist);
 /explore/save_map saves the current map (also usable while mapping by teleop).
@@ -57,6 +61,8 @@ PARAMS = {
     'finish_goals': True,        # frontier explored on the way: drive on to its goal if it is still safe
     'settle_timeout': 6.0,       # max wait for a fresh /map after reaching a goal
     'finish_wait': 6.0,          # s with no frontier before exploration ends
+    'coverage_timeout': 45.0,    # s without coverage_step more free area before exploration ends (0 = off)
+    'coverage_step': 0.05,       # m2
     'max_duration': 300.0,       # s, then return home anyway
     'return_home': True,
     'map_file': '/home/ros2_ws/maps/sandbox',   # without extension
@@ -80,6 +86,9 @@ class AutoMapper(NavStateNode):
         self.progress = None          # (best distance to goal, time it was set)
         self.n_goals = 0
         self.last_plan = 0.0
+        self.coverage = (0.0, 0.0)    # (free area at its last growth by coverage_step, time of that growth)
+        self.coverage_count = -1      # map_count of the last map checked
+        self.peak = None              # (free area, /map, s into the exploration) of the map with the largest free area
 
     # ---------------------------------------------------------------- helpers
     def plan(self, robot_xy):
@@ -93,11 +102,12 @@ class AutoMapper(NavStateNode):
                               goal_clearance=float(c['goal_clearance']),
                               unknown_clearance=float(c['unknown_clearance']))
 
-    def save_map(self, path_base=None):
-        if self.map is None:
+    def save_map(self, path_base=None, msg=None):
+        msg = msg or self.map
+        if msg is None:
             return False, 'no map received yet'
-        grid, resolution, (x0, y0) = self.map_grid()
-        q = self.map.info.origin.orientation
+        grid, resolution, (x0, y0) = self.map_grid(msg)
+        q = msg.info.origin.orientation
         origin = (x0, y0, yaw_from_quaternion(q.x, q.y, q.z, q.w))
         try:
             path = save_map_files(path_base or self.cfg['map_file'], grid, resolution, origin)
@@ -124,6 +134,7 @@ class AutoMapper(NavStateNode):
     def begin(self):
         if self.state == 'STOPPED':                 # resume, keeping home and blacklist
             self.target, self.settle_until, self.no_frontier_since = None, None, None
+            self.coverage = (self.coverage[0], time.time())
             self.set_state('EXPLORE')
             return True
         pose = self.robot_pose()
@@ -136,6 +147,7 @@ class AutoMapper(NavStateNode):
             pose[0], pose[1], math.degrees(pose[2])))
         self.blacklist, self.target, self.reached = [], None, None
         self.settle_until, self.no_frontier_since, self.n_goals = None, None, 0
+        self.coverage, self.coverage_count, self.peak = (0.0, self.t_start), -1, None
         self.set_state('EXPLORE')
         return True
 
@@ -198,6 +210,23 @@ class AutoMapper(NavStateNode):
                         f'Goal {self.n_goals}')
         self.progress = (self.remaining(pose), time.time())
 
+    def coverage_stalled(self):
+        """Track the free area of /map: True when it has not grown by coverage_step for coverage_timeout s. Site
+        11-06: the area was complete 61 s into the exploration (walls 8.7 cm thick); two small frontiers in corners
+        took another 104 s without any new area, and the walls ended up 11.2 cm thick. Also keeps the map with the
+        largest free area (self.peak; the free area shrinks again as the walls thicken)."""
+        if self.map_count != self.coverage_count:
+            self.coverage_count = self.map_count
+            grid, resolution, _ = self.map_grid()
+            free = int(((grid >= 0) & (grid < 50)).sum()) * resolution ** 2
+            now = time.time()
+            if self.peak is None or free > self.peak[0]:
+                self.peak = (free, self.map, now - self.t_start)
+            if free >= self.coverage[0] + float(self.cfg['coverage_step']):
+                self.coverage = (free, now)
+        timeout = float(self.cfg['coverage_timeout'])
+        return timeout > 0 and time.time() - self.coverage[1] > timeout
+
     def remaining(self, pose):
         """Distance left to the goal along the route (straight line if there is none)."""
         d = self.route_remaining(pose)
@@ -250,6 +279,10 @@ class AutoMapper(NavStateNode):
         self.get_logger().info(f'Exploration finished ({why}) after {time.time() - self.t_start:.1f}s, '
                                f'{self.n_goals} goals, {len(self.blacklist)} blacklisted')
         self.save_map()
+        if self.peak is not None:
+            free, msg, t = self.peak
+            self.get_logger().info(f'Largest free area {free:.2f} m2, {t:.0f} s into the exploration:')
+            self.save_map(self.cfg['map_file'] + '_peak', msg)
         if self.cfg['return_home']:
             self.return_home()
         else:
@@ -313,6 +346,8 @@ class AutoMapper(NavStateNode):
         elif s == 'EXPLORE':
             if time.time() - self.t_start > float(self.cfg['max_duration']):
                 self.finish_exploration(f'max_duration {self.cfg["max_duration"]:.0f}s')
+            elif self.coverage_stalled():
+                self.finish_exploration(f'no new area for {self.cfg["coverage_timeout"]:.0f}s')
             else:
                 self.explore_step(pose)
 

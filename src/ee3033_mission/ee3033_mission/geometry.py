@@ -252,6 +252,19 @@ def wall_sdf(grid, resolution, occupied_thresh=50):
     return (out - inside) * resolution
 
 
+def line_min_sdf(sdf, resolution, origin_xy, a, b):
+    """Smallest wall_sdf value (m) on the straight line from a to b (x, y), sampled every half cell; -inf if the
+    line leaves the map."""
+    n = max(2, int(math.hypot(b[0] - a[0], b[1] - a[1]) / (resolution / 2)) + 2)
+    xs, ys = np.linspace(a[0], b[0], n), np.linspace(a[1], b[1], n)
+    rows = np.floor((ys - origin_xy[1]) / resolution).astype(int)
+    cols = np.floor((xs - origin_xy[0]) / resolution).astype(int)
+    h, w = sdf.shape
+    if rows.min() < 0 or cols.min() < 0 or rows.max() >= h or cols.max() >= w:
+        return float('-inf')
+    return float(sdf[rows, cols].min())
+
+
 def escape_move(grid, sdf, resolution, origin_xy, pose, target, max_forward, max_backward, occupied_thresh=50):
     """Straight move along the robot's heading away from the map walls, as (d, clearance at the end): d > 0
     forward, d < 0 backward. The shortest move that ends at least `target` from the walls (forward unless
@@ -333,3 +346,23 @@ def order_nearest_neighbour(start_xy, points):
         cur = remaining.pop(i)
         tour.append(cur)
     return tour
+
+
+def scale_odom_step(prev_raw, raw, corrected, yaw_scale, lin_scale=1.0, yaw_scale_cw=None):
+    """Next corrected odometry pose (x, y, yaw) from two consecutive raw poses: the raw step is taken in the
+    robot frame of prev_raw (forward, lateral, turn), the turn scaled by yaw_scale (left turns; right turns by
+    yaw_scale_cw, default the same) and the shift by lin_scale, and applied to `corrected`. The shift keeps its
+    direction relative to the step's midpoint heading, so it turns by (scale - 1) * raw turn / 2 beyond the corrected
+    start heading (scales 1: the raw path exactly). On our car the base over-reports left turns by ~2.5 % and right
+    turns by ~4.5 % (scan-to-map heading over 630 two-second windows of two site missions, 11-11)."""
+    px, py, pa = prev_raw
+    dx, dy = raw[0] - px, raw[1] - py
+    fwd = math.cos(pa) * dx + math.sin(pa) * dy
+    lat = -math.sin(pa) * dx + math.cos(pa) * dy
+    raw_turn = float(wrap_angle(raw[2] - pa))
+    k = yaw_scale if raw_turn >= 0.0 or yaw_scale_cw is None else yaw_scale_cw
+    cx, cy, ca = corrected
+    rot = ca + (k - 1.0) * raw_turn / 2.0
+    return (cx + lin_scale * (math.cos(rot) * fwd - math.sin(rot) * lat),
+            cy + lin_scale * (math.sin(rot) * fwd + math.cos(rot) * lat),
+            float(wrap_angle(ca + k * raw_turn)))

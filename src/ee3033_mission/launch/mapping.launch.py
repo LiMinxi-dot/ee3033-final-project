@@ -3,6 +3,7 @@
   ros2 launch ee3033_mission mapping.launch.py               # drive with teleop from the VM
   ros2 launch ee3033_mission mapping.launch.py explore:=true # autonomous: Nav2 + our auto_mapper
   ros2 launch ee3033_mission mapping.launch.py explore:=true explorer:=lite   # vendor explore_lite instead
+  ros2 launch ee3033_mission mapping.launch.py explore:=true max_speed:=0.10   # Nav2 speed limit (m/s)
 
 With explore:=true the auto_mapper starts in a dry run (frontiers shown on
 /explore/frontiers, robot still). Start it with
@@ -33,10 +34,10 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
-def include(pkg, name, condition=None):
+def include(pkg, name, condition=None, args=None):
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(get_package_share_directory(pkg), 'launch', name)),
-        condition=condition)
+        condition=condition, launch_arguments=(args or {}).items())
 
 
 def generate_launch_description():
@@ -57,7 +58,12 @@ def generate_launch_description():
                              # a cell is a wall if > this share of the rays reaching it end there (default 0.1):
                              # a thin wall mostly seen along its length (rays grazing past it in its cell) was
                              # mapped as free space but for 1-2 cells
-                             'occupancy_threshold': 0.05}])
+                             'occupancy_threshold': 0.05,
+                             # blur of the scan-matching score grid (default 0.1 m): with 0.1 poses a few cm or deg
+                             # apart scored alike and the match stayed where the odometry put it (it over-reports
+                             # turns by 4-10 %); 0.05 ~ the LiDAR noise of the swaying robot. Offline replays of a
+                             # home and a site bag (11-06): walls 20-30 % thinner, inner walls no longer merged
+                             'correlation_search_space_smear_deviation': 0.05}])
     watchdog = Node(package='ee3033_mission', executable='cmd_vel_watchdog', output='screen', parameters=[params])
     mapper = Node(package='ee3033_mission', executable='auto_mapper', output='screen', condition=ours,
                   parameters=[params, {'auto_start': LaunchConfiguration('auto_start')}])
@@ -67,7 +73,7 @@ def generate_launch_description():
                    parameters=[{'target_frame': 'map', 'source_frame': 'base_footprint'}])
     after_slam = RegisterEventHandler(OnProcessExit(target_action=wait_tf, on_exit=[
         LogInfo(msg='[ee3033] SLAM is publishing map -> base_footprint: starting Nav2'),
-        include('ee3033_mission', 'nav2.launch.py'),
+        include('ee3033_mission', 'nav2.launch.py', args={'max_speed': LaunchConfiguration('max_speed')}),
         mapper,
         TimerAction(period=5.0, actions=[include('balance_mapping', 'balance_explorer_lite.launch.py', lite)]),
     ]))
@@ -76,6 +82,8 @@ def generate_launch_description():
                               description='true: Nav2 + an explorer map the sandbox autonomously'),
         DeclareLaunchArgument('explorer', default_value='ee3033',
                               description='ee3033: our auto_mapper (return home + save map); lite: explore_lite'),
+        DeclareLaunchArgument('max_speed', default_value='0.125',
+                              description='m/s, Nav2 (DWB and the velocity smoother) while exploring'),
         DeclareLaunchArgument('auto_start', default_value='false',
                               description='true: auto_mapper starts exploring as soon as Nav2 is ready'),
         include('ee3033_mission', 'base_sensors.launch.py'),

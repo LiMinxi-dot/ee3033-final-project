@@ -5,9 +5,10 @@ import numpy as np
 import pytest
 
 from ee3033_mission.geometry import (apply_body_offset, escape_move, focal_length_px, free_ahead,
-                                     fuse_observations, generate_viewpoints, intrinsics, nearest_cluster_bearing,
+                                     fuse_observations, generate_viewpoints, intrinsics, line_min_sdf,
+                                     nearest_cluster_bearing,
                                      order_nearest_neighbour, pixel_to_bearing, plan_coverage,
-                                     range_from_object_height, ray_range_from_scan, rotation_clear,
+                                     range_from_object_height, ray_range_from_scan, rotation_clear, scale_odom_step,
                                      scan_to_points, transform_to_xyyaw, wall_sdf, wrap_angle,
                                      yaw_from_quaternion, yaw_to_quaternion)
 
@@ -176,6 +177,14 @@ def test_wall_sdf_is_negative_inside_walls():
     assert sdf[10, 20] == pytest.approx(-0.05) and sdf[10, 23] == pytest.approx(0.05)
 
 
+def test_line_min_sdf_finds_the_closest_approach_to_a_wall():
+    g, sdf = wall_x()                            # wall cells from x = 1.00 m (sdf between cell centres)
+    assert line_min_sdf(sdf, 0.05, (0, 0), (0.52, 0.5), (0.82, 0.5)) == pytest.approx(0.20)   # towards it
+    assert line_min_sdf(sdf, 0.05, (0, 0), (0.87, 0.2), (0.87, 1.8)) == pytest.approx(0.15)   # along it
+    assert line_min_sdf(sdf, 0.05, (0, 0), (0.52, 0.5), (1.42, 0.5)) < 0                      # through it
+    assert line_min_sdf(sdf, 0.05, (0, 0), (0.52, 0.5), (2.52, 0.5)) == float('-inf')         # off the map
+
+
 def test_escape_moves_straight_away_from_the_wall():
     g, sdf = wall_x()
     pose = (0.94, 0.5)                           # 0.10 m from the wall (cell centres), Nav2's inscribed zone
@@ -218,3 +227,42 @@ def test_rotation_clear_depends_on_the_gap_to_the_wall():
         assert rotation_clear(side_wall(0.04, side), 0.07, 0.11, math.radians(-90))
         assert not rotation_clear(side_wall(0.02, side), 0.07, 0.11, math.radians(30))  # a corner hits it
         assert not rotation_clear(side_wall(0.02, side), 0.07, 0.11, math.radians(-30))
+
+
+def _integrate(raw_poses, yaw_scale, lin_scale=1.0, yaw_scale_cw=None):
+    c = raw_poses[0]
+    for a, b in zip(raw_poses, raw_poses[1:]):
+        c = scale_odom_step(a, b, c, yaw_scale, lin_scale, yaw_scale_cw)
+    return c
+
+
+def test_scale_odom_step_identity():
+    raw = [(0.1 * i, 0.02 * i * i, 0.3 * i) for i in range(10)]
+    assert _integrate(raw, 1.0) == pytest.approx((raw[-1][0], raw[-1][1], float(wrap_angle(raw[-1][2]))), abs=0.01)
+
+
+def test_scale_odom_step_spin_and_straight():
+    # in place: 180 deg reported in 36 steps -> 171 deg with 0.95, position stays
+    spin = [(0.0, 0.0, float(wrap_angle(math.radians(5 * i)))) for i in range(37)]
+    x, y, yaw = _integrate(spin, 0.95)
+    assert (x, y) == pytest.approx((0.0, 0.0), abs=1e-9)
+    assert math.degrees(yaw) == pytest.approx(171.0, abs=1e-6)
+    # straight 1 m along the reported heading 90 deg; distances x 0.9
+    line = [(0.0, 0.1 * i, math.pi / 2) for i in range(11)]
+    assert _integrate(line, 0.95, 0.9) == pytest.approx((0.0, 0.9, math.pi / 2), abs=1e-9)
+
+
+def test_scale_odom_step_turn_then_drive():
+    # reported: turn 90 deg left, then 1 m forward (to (0, 1)); with turns x 0.9 the corrected heading is 81 deg
+    raw = [(0.0, 0.0, math.radians(10 * i)) for i in range(10)] + [(0.0, 0.1 * i, math.pi / 2) for i in range(1, 11)]
+    x, y, yaw = _integrate(raw, 0.9)
+    assert math.degrees(yaw) == pytest.approx(81.0, abs=1e-6)
+    assert (x, y) == pytest.approx((math.cos(math.radians(81)), math.sin(math.radians(81))), abs=1e-6)
+
+
+def test_scale_odom_step_left_right():
+    left = [(0.0, 0.0, math.radians(5 * i)) for i in range(19)]       # 90 deg left
+    right = [(0.0, 0.0, math.radians(-5 * i)) for i in range(19)]     # 90 deg right
+    assert math.degrees(_integrate(left, 0.98, 1.0, 0.95)[2]) == pytest.approx(88.2)
+    assert math.degrees(_integrate(right, 0.98, 1.0, 0.95)[2]) == pytest.approx(-85.5)
+    assert math.degrees(_integrate(right, 0.98)[2]) == pytest.approx(-88.2)          # cw default: the same scale

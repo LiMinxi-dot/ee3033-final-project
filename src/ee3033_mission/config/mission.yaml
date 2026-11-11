@@ -58,20 +58,42 @@ auto_mapper:
                                    # a thin wall end-on, and the wall was missing from the map)
     nav_timeout: 30.0              # s per Nav2 goal (route legs are at most route_max_leg long)
     stuck_time: 8.0                # s; a Nav2 goal during which the robot moves less than stuck_move ends:
-    stuck_move: 0.05               # m  reached if within stuck_accept of it, else failed (escape, retry)
-    stuck_accept: 0.20             # m
+    stuck_move: 0.08               # m  reached if within stuck_accept of it, else failed (drive or escape, retry).
+                                   #    0.05 never fired: sway + SLAM steps move the pose ~6 cm (site 11-06)
+    stuck_accept: 0.20             # m  4 s ended DWB's in-place turns as stuck (site 11-06): back to 8 s
     leg_skip: 0.15                 # m; a route leg whose waypoint is this close already is skipped
+    leg_pass: 0.15                 # m; this close to a waypoint that is not the last, the next leg is sent at once
+                                   # (no stop; Nav2 preempts the goal) if the straight line from the robot to the
+                                   # next waypoint keeps route_clearance. Waiting for "Reached" took 3-8 s per leg
+                                   # (11-06, 11-11). 0 = off
     settle_timeout: 6.0            # max wait for a fresh /map after reaching a goal
     finish_wait: 6.0               # s without any reachable frontier -> exploration done
+    coverage_timeout: 45.0         # s without coverage_step more free area -> exploration done (0 = off). Site 11-06:
+                                   # the area was complete after 61-68 s, the rest (40-104 s) only thickened the walls;
+                                   # mid-run there were 30-36 s without new area while driving to the far side
+    coverage_step: 0.05            # m2 of free area that counts as new (the map at the largest free area is also
+                                   # saved, as <map_file>_peak)
     max_duration: 300.0            # s, then return home anyway
     return_home: true
     home_retries: 2
     home_tolerance: 0.25
+    home_heading: true             # at home, turn in place (Nav2 spin) to the start heading: the mission's initial pose
+    home_yaw_tolerance_deg: 5.0    # turn again while further off (at most 3 turns; odometry over-turns 4-6 %)
     route_clearance: 0.15          # m; the way home is planned through cells this far from walls/unknown, along
                                    # corridor centres, and driven in straight legs of at most route_max_leg
     route_max_leg: 0.8
     turn_first_deg: 45.0           # goal direction more than this off the heading: turn in place first (Nav2
                                    # spin); DWB turned in a forward arc into the wall next to the robot. 0 = off
+    drive: false                   # OFF since 11-06: a drive stopped 6.8 cm before a wall, inside the costmaps'
+                                   # blind zone (obstacle_min_range 0.13), and DWB then turned into it. When on:
+                                   # robot closer than escape_trigger to a map wall, or a Nav2 goal failed or
+                                   # stalled: if the LiDAR shows the robot's rectangle free all the way (turn
+                                   # and straight line) to the leg's end, drive there ourselves (the map walls are
+                                   # 2-3 cells thick: often Nav2 cannot go on while the real way is clear)
+    drive_speed: 0.125             # m/s, as Nav2 while mapping (mapping.launch.py max_speed)
+    drive_turn_speed: 0.5          # rad/s, as the Nav2 spin
+    drive_stop: 0.05               # m of LiDAR-free space ahead of the front edge; less stops the drive
+    drive_steer_gain: 1.5          # rad/s per rad of heading error
     escape: true                   # robot closer than escape_trigger to a map wall (Nav2 will neither plan nor
     escape_trigger: 0.11           # turn there; Nav2 robot_radius 0.10 + padding 0.01): before a goal, and once
                                    # after a failed one, drive straight
@@ -97,9 +119,12 @@ target_localizer:
     # optical axis about 8 deg to the left. Height does not matter: localization is planar.
     # Re-measure only if the camera is moved: x/y by hand, yaw with
     #   ros2 run ee3033_mission camera_lidar_check
+    # Yaw: camera_lidar_check 11-11 with the new laser TF (yaw -0.07 rad): 3.0 deg (30 samples, spread 0.3 deg,
+    # bottle at 0.76 m). Until then 4.3 (8.3 measured against the old laser TF, minus 4.0); a mission with 4.3
+    # reported the target ~6 cm off (tape against the map walls, notes/2026-11-11-leg-pass.md).
     camera_offset_x: 0.0
     camera_offset_y: 0.015
-    camera_offset_yaw_deg: 8.3
+    camera_offset_yaw_deg: 3.0
     use_camera_info: true
     min_score: 0.5
     min_range: 0.15
@@ -155,15 +180,28 @@ mission_manager:
     max_viewpoints: 40
     nav_timeout: 30.0              # s per Nav2 goal (route legs are at most route_max_leg long)
     stuck_time: 8.0                # s; a Nav2 goal during which the robot moves less than stuck_move ends:
-    stuck_move: 0.05               # m  reached if within stuck_accept of it, else failed (escape, retry)
-    stuck_accept: 0.20             # m
+    stuck_move: 0.08               # m  reached if within stuck_accept of it, else failed (drive or escape, retry).
+                                   #    0.05 never fired: sway + SLAM steps move the pose ~6 cm (site 11-06)
+    stuck_accept: 0.20             # m  4 s ended DWB's in-place turns as stuck (site 11-06): back to 8 s
     leg_skip: 0.15                 # m; a route leg whose waypoint is this close already is skipped
+    leg_pass: 0.15                 # m; this close to a waypoint that is not the last, the next leg is sent at once
+                                   # (no stop; Nav2 preempts the goal) if the straight line from the robot to the
+                                   # next waypoint keeps route_clearance. Waiting for "Reached" took 3-8 s per leg
+                                   # (11-06, 11-11). 0 = off
     spin_timeout: 25.0
     home_tolerance: 0.25
+    home_heading: true             # at home, turn in place (Nav2 spin, ~6 s for 180 deg) to the start heading, so
+                                   # the robot is ready for the next run (not assessed, project instructions 5.3).
+                                   # Until 11-11 off: DWB's own turn to the goal heading took 9-12 s (site 11-06)
+    home_yaw_tolerance_deg: 5.0
     home_retries: 2
     route_clearance: 0.15          # m; routes to viewpoints and home: straight legs along corridor centres
     route_max_leg: 0.8
     turn_first_deg: 45.0           # as auto_mapper
+    drive: false                   # as auto_mapper (off); drive_speed comes from mission.launch.py (max_speed)
+    drive_turn_speed: 0.5
+    drive_stop: 0.05
+    drive_steer_gain: 1.5
     escape: true                   # as auto_mapper (a viewpoint spin left the robot in a map wall: stuck)
     escape_trigger: 0.11
     escape_target: 0.14
