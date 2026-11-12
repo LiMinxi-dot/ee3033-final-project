@@ -11,7 +11,7 @@ EE3033 Systems Integration and Design Lab, NUS. Group 6.
 | Package | Contents |
 |---|---|
 | [`ee3033_interfaces`](src/ee3033_interfaces) | Messages: `TargetDetection`, `TargetDetectionArray`, `TargetEstimate` |
-| [`ee3033_mission`](src/ee3033_mission) | Nodes `auto_mapper`, `target_detector`, `target_localizer`, `mission_manager`, `odom_scaler`, `heading_hold`, `cmd_vel_watchdog`; tools `setup_check`, `camera_lidar_check`, `odom_turn_test`; `scripts/demo.sh`; launch files; parameters in `config/mission.yaml`; RViz config |
+| [`ee3033_mission`](src/ee3033_mission) | Nodes `auto_mapper`, `target_detector`, `target_localizer`, `mission_manager`, `odom_scaler`, `heading_hold`, `cmd_vel_watchdog`, `key_teleop`; tools `setup_check`, `camera_lidar_check`, `odom_turn_test`, `save_map`; `scripts/demo.sh`; launch files; parameters in `config/mission.yaml`; RViz config |
 
 See [`src/ee3033_mission/README.md`](src/ee3033_mission/README.md) for nodes, topics and design details.
 
@@ -135,11 +135,17 @@ ros2 run ee3033_mission demo.sh mapping --local   # car at the start: explore, r
 ros2 run ee3033_mission demo.sh mission --local   # YOLO loads first; then put the car on the start mark and press
                                                   # Enter: search, report the target, return home
 ros2 run ee3033_mission demo.sh stop      # stop the car and all ROS nodes
+ros2 run ee3033_mission demo.sh manual    # fallback for mapping: SLAM + driving from this terminal
+                                          #   (w/s/a/d/q/e, space stops); Ctrl-C saves the map
 ros2 service call /mission/stop std_srvs/srv/Trigger   # emergency stop from the computer (or /explore/stop)
 
 # watch from the computer
 rviz2 -d $(ros2 pkg prefix ee3033_mission)/share/ee3033_mission/rviz/mission.rviz
 ```
+
+`demo.sh manual` (when the examiner allows driving during mapping): hold a key to drive (0.10 m/s, 0.4 rad/s,
+ramped; the car stops 0.6 s after the key is released); drive back to the start mark and press Ctrl-C: the car
+stops, `save_map` writes `/home/ros2_ws/maps/sandbox.yaml` (as the autonomous mapping does) and all nodes stop.
 
 `--local` keeps all ROS traffic on the car (`ROS_LOCALHOST_ONLY=1`): with a poor Wi-Fi link the base and LiDAR
 drivers stalled for up to 3 s and the car fell. The computer then sees nothing (no RViz, no emergency stop from it:

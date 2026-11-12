@@ -16,6 +16,7 @@ It uses the vendor packages on the car (`balance_robot_base`, `lslidar_driver_n1
 | `auto_mapper` | `/map` (SLAM Toolbox), TF, Nav2 action `navigate_to_pose` | `/explore/state`, `/explore/frontiers`, map files |
 | `odom_scaler` | `/odom_raw` (the base, with `odom_yaw_scale*` != 1) | `/odom`, TF `odom_combined -> base_footprint` with the base's left / right turns scaled |
 | `heading_hold` | `/odom`, `/robot_euler`, `/explore/state`, `/mission/state` | `/cmd_vel` (turn in place back to the start heading until the exploration / mission starts; mapping and mission launch) |
+| `key_teleop` | keyboard (terminal) | `/cmd_vel_teleop` (manual driving for `demo.sh manual`: w/s/a/d/q/e, space stops, ramped 0.10 m/s / 0.4 rad/s) |
 
 Services: `/mission/start`, `/mission/stop` (`std_srvs/Trigger`), `/target_localizer/reset` (`std_srvs/Empty`),
 `/explore/start`, `/explore/stop`, `/explore/save_map` (`std_srvs/Trigger`).
@@ -130,6 +131,8 @@ ros2 run ee3033_mission demo.sh mapping   # robot at the start: explore, return,
 # place the target
 ros2 run ee3033_mission demo.sh mission   # robot at the start: search, report, return home
 ros2 run ee3033_mission demo.sh stop      # stop the robot and all ROS nodes (also leftovers of earlier runs)
+ros2 run ee3033_mission demo.sh manual    # fallback for step 1: SLAM + keyboard driving in this terminal;
+                                          #   Ctrl-C (robot back on the start mark) saves the map
 # --local after the step (demo.sh mapping --local): ROS traffic stays on the car (ROS_LOCALHOST_ONLY=1); the VM
 #   and RViz see nothing. Big arena 11-12 with poor Wi-Fi: base and LiDAR nodes stalled up to 3 s, two falls.
 ```

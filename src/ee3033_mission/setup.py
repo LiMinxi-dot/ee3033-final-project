@@ -36,6 +36,8 @@ setup(
             'odom_scaler = ee3033_mission.odom_scaler:main',
             'odom_turn_test = ee3033_mission.odom_turn_test:main',
             'heading_hold = ee3033_mission.heading_hold:main',
+            'key_teleop = ee3033_mission.key_teleop:main',
+            'save_map = ee3033_mission.save_map:main',
         ],
     },
 )

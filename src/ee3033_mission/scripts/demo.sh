@@ -7,6 +7,8 @@
 #   ros2 run ee3033_mission demo.sh mission   # step 2: YOLO loads first; place the robot on the start mark and
 #                                             #   press Enter: searches, reports, returns home
 #   ros2 run ee3033_mission demo.sh stop      # stop the robot and all ROS nodes
+#   ros2 run ee3033_mission demo.sh manual    # fallback for step 1: SLAM + driving with the keyboard in this
+#                                             #   terminal; Ctrl-C (robot back on the start mark) saves the map
 #   Further arguments go to the launch file, e.g. demo.sh mapping laser_yaw:=0.0 max_speed:=0.10
 #   --local (or DEMO_LOCAL=1): all ROS traffic stays on the car (ROS_LOCALHOST_ONLY=1); the VM sees nothing (no
 #   RViz, no ros2 CLI, no emergency stop from the VM: Ctrl-C here, or demo.sh stop on the car). 11-12, big arena with
@@ -24,6 +26,8 @@
 # Emergency stop from the VM (not with --local): ros2 service call /explore/stop (or /mission/stop) std_srvs/srv/Trigger
 
 set -u
+ulimit -c 0        # no core dumps: the LiDAR driver aborts on every stop and left a 14 MB core each time in the
+                   # working directory (16 of them, 194 MB, filled the SD card on 11-12)
 MAP=/home/ros2_ws/maps/sandbox
 MAP_LOG=/tmp/ee3033_mapping.log
 MISSION_LOG=/tmp/ee3033_mission.log
@@ -102,9 +106,27 @@ save_run() {       # keep this run's log, maps and result (the next run overwrit
   say "log and map saved to $RUN_DIR"
 }
 
+save_manual_map() {  # manual mapping: SLAM's map now -> $MAP.pgm / .yaml (what the mission reads)
+  say "saving the map to $MAP ..."
+  # our saver, not /slam_toolbox/save_map: that one runs Nav2's map_saver, which waited only 2 s for /map and
+  # failed on 11-12 (result 255), and writes free_thresh 0.25 (unknown cells read as free)
+  timeout 25 ros2 run ee3033_mission save_map "$MAP" > /tmp/ee3033_save_map.log 2>&1
+  if [ -f "$MAP.yaml" ] && [ "$(stat -c %Y "$MAP.yaml")" -ge "$T0" ]; then
+    say "map saved: $MAP.yaml"
+  else
+    say "WARNING: the map was NOT saved (see /tmp/ee3033_save_map.log); the nodes are stopped now"
+  fi
+}
+
 on_interrupt() {
-  say "interrupted: stopping the robot and all nodes"
-  [ -n "$LAUNCH_PID" ] && stop_robot
+  if [ "$STEP" = manual ] && [ -n "$LAUNCH_PID" ]; then
+    say "Ctrl-C: stopping the robot, saving the map, stopping all nodes"
+    stop_robot
+    save_manual_map
+  else
+    say "interrupted: stopping the robot and all nodes"
+    [ -n "$LAUNCH_PID" ] && stop_robot
+  fi
   stop_all
   save_run "$STEP"
   exit 130
@@ -135,8 +157,8 @@ wait_state() {     # wait_state <log>: sets RESULT to the final state (DONE / FA
 }
 
 case "${1:-}" in
-  mapping|mission|stop) STEP=$1;;
-  *) echo "usage: ros2 run ee3033_mission demo.sh mapping|mission|stop [--local] [launch args]"; exit 2;;
+  mapping|mission|manual|stop) STEP=$1;;
+  *) echo "usage: ros2 run ee3033_mission demo.sh mapping|mission|manual|stop [--local] [launch args]"; exit 2;;
 esac
 LOCAL=${DEMO_LOCAL:-0}
 LAUNCH_ARGS=()
@@ -183,6 +205,30 @@ if [ "$1" = mapping ]; then
   fi
   say "mapping done in $(( $(date +%s) - T0 )) s, map saved to $MAP.yaml. Stopping the mapping nodes."
   stop_all
+  say "Next (robot at the start, target placed): ros2 run ee3033_mission demo.sh mission"
+  exit 0
+fi
+
+if [ "$1" = manual ]; then
+  [ -t 0 ] || { say "manual mapping needs a terminal (ssh -t, docker exec -it)"; exit 2; }
+  say "STEP 1 (manual): SLAM + driving with the keyboard. The map origin is where the robot stands now."
+  RUN_LOG=$MAP_LOG
+  start_launch "$MAP_LOG" mapping.launch.py "${ODOM_ARGS[@]}" "${LAUNCH_ARGS[@]}"
+  start_bag /scan /scan_fixed /tf /tf_static /odom /robot_euler /map /cmd_vel /cmd_vel_teleop
+  say "waiting for SLAM Toolbox ..."
+  for _ in $(seq 1 60); do
+    grep -q "starting SLAM Toolbox" "$MAP_LOG" && timeout 5 ros2 service list 2>/dev/null | grep -q '^/slam_toolbox/save_map$' \
+      && break
+    sleep 1
+  done
+  say "SLAM is up. Drive slowly round the whole arena, back to the start mark facing the start direction, then Ctrl-C:"
+  say "the robot stops, the map is saved to $MAP.yaml and all nodes stop."
+  ros2 run ee3033_mission key_teleop    # Ctrl-C ends it and runs on_interrupt (stop, save the map, stop all)
+  say "key_teleop ended: stopping the robot, saving the map, stopping all nodes"
+  stop_robot
+  save_manual_map
+  stop_all
+  save_run mapping
   say "Next (robot at the start, target placed): ros2 run ee3033_mission demo.sh mission"
   exit 0
 fi
