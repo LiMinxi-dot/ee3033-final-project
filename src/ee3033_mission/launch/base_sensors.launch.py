@@ -21,6 +21,7 @@ does not exist on the car.
 """
 
 import os
+import resource
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
@@ -57,6 +58,10 @@ def base_nodes(context, config, odom, robot):
 
 
 def generate_launch_description():
+    # No core dumps for the nodes started from here (they inherit the launch process's limit): the LiDAR driver
+    # aborts on every stop and left a 10-24 MB core in its working directory each time (103 in / on 11-13, 1.5 GB,
+    # plus 16 in /home/ros2_ws: the SD card ran full).
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     config = os.path.join(get_package_share_directory('balance_robot_base'), 'config', 'base_params.yaml')
     with open(config) as f:
         p = yaml.safe_load(f)['balance_robot_node']['ros__parameters']
