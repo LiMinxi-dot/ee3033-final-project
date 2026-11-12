@@ -154,7 +154,8 @@ def _goal_in_sight(free, cand_r, cand_c, cr, cc, near, reach_cells, samples=12, 
 def plan_frontiers(grid, resolution, origin_xy, robot_xy, *, robot_radius=0.15, min_frontier_size=0.15,
                    goal_reach=0.5, gain_weight=0.3, blacklist=(), blacklist_radius=0.3,
                    home_xy=None, max_radius=0.0, occupied_thresh=50, seed_radius=0.5, goal_clearance=0.15,
-                   unknown_clearance=0.20, pass_clearance=0.09):
+                   unknown_clearance=0.20, pass_clearance=0.09, small_frontier_size=0.0, small_goal_clearance=0.20,
+                   small_fallback=True):
     """Find frontiers, check them and rank them.
 
     Returns (frontiers, seeded). frontiers is sorted by cost, the best one with
@@ -172,6 +173,11 @@ def plan_frontiers(grid, resolution, origin_xy, robot_xy, *, robot_radius=0.15, 
     (a way the robot could pass) count, otherwise the frontier is UNREACHABLE: free cells seen beyond a wall
     (LiDAR beams through a crack or over the wall) gave frontiers the robot drove to the wall for, could never
     resolve, and had to turn back from.
+    A frontier shorter than small_frontier_size (a crack, a board joint, a corner around a wall end, or the mouth
+    of a pocket) is looked at, not driven into: its goal must be in sight of it and preferably at least
+    small_goal_clearance from walls; without any goal in sight it is UNREACHABLE. If a real passage is behind it,
+    the view from there turns it into a larger frontier (lab maze 11-12: the robot drove into a 0.25 m pocket
+    to 0.11 m from the walls, SLAM's heading slipped 5-6 deg there and the far walls were drawn again rotated).
     cost = path length to the goal - gain_weight * frontier size, so near and
     large frontiers win. seeded is False if no traversable cell was found near
     the robot (the robot pose or the map is not ready): then nothing is reachable
@@ -219,13 +225,18 @@ def plan_frontiers(grid, resolution, origin_xy, robot_xy, *, robot_radius=0.15, 
         else:
             near = (labels == k) & side
             to_frontier = cv2.distanceTransform((~near).astype(np.uint8), cv2.DIST_L2, 5)   # cells
-            cand_r, cand_c = np.nonzero(reachable & (to_frontier <= reach_cells))
-            if cand_r.size == 0:
+            in_reach = reachable & (to_frontier <= reach_cells)
+            small = f.size < small_frontier_size
+            cand_r, cand_c = np.nonzero(in_reach & (to_wall >= small_goal_clearance) if small else in_reach)
+            i = _goal_in_sight(free, cand_r, cand_c, cr, cc, near, reach_cells) if cand_r.size else None
+            if small and i is None and small_fallback:   # no open place in sight of it: any safe one in sight
+                cand_r, cand_c = np.nonzero(in_reach)
+                i = _goal_in_sight(free, cand_r, cand_c, cr, cc, near, reach_cells) if cand_r.size else None
+            if i is None and not small and cand_r.size:   # in sight from nowhere: the safe cell closest to the centre
+                i = int(np.argmin((cand_r - cr) ** 2 + (cand_c - cc) ** 2))
+            if i is None:
                 f.status = UNREACHABLE
             else:
-                i = _goal_in_sight(free, cand_r, cand_c, cr, cc, near, reach_cells)
-                if i is None:            # in sight from nowhere: as before, the safe cell closest to the centre
-                    i = int(np.argmin((cand_r - cr) ** 2 + (cand_c - cc) ** 2))
                 gr, gc = int(cand_r[i]), int(cand_c[i])
                 f.goal = grid_to_world(gr, gc, origin_xy, resolution)
                 f.distance = float(dist[gr, gc] * resolution)

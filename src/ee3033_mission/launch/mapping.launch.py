@@ -73,7 +73,8 @@ def generate_launch_description():
                    parameters=[{'target_frame': 'map', 'source_frame': 'base_footprint'}])
     after_slam = RegisterEventHandler(OnProcessExit(target_action=wait_tf, on_exit=[
         LogInfo(msg='[ee3033] SLAM is publishing map -> base_footprint: starting Nav2'),
-        include('ee3033_mission', 'nav2.launch.py', args={'max_speed': LaunchConfiguration('max_speed')}),
+        include('ee3033_mission', 'nav2.launch.py', args={'max_speed': LaunchConfiguration('max_speed'),
+                                                            'keep_off_walls': LaunchConfiguration('keep_off_walls')}),
         mapper,
         TimerAction(period=5.0, actions=[include('balance_mapping', 'balance_explorer_lite.launch.py', lite)]),
     ]))
@@ -84,6 +85,10 @@ def generate_launch_description():
                               description='ee3033: our auto_mapper (return home + save map); lite: explore_lite'),
         DeclareLaunchArgument('max_speed', default_value='0.125',
                               description='m/s, Nav2 (DWB and the velocity smoother) while exploring'),
+        DeclareLaunchArgument('heading_hold', default_value='true',
+                              description='hold the start heading until the robot starts (base_sensors.launch.py)'),
+        DeclareLaunchArgument('keep_off_walls', default_value='true',
+                              description='Nav2 keeps the robot off walls (nav2.launch.py); false: vendor DWB/inflation'),
         DeclareLaunchArgument('auto_start', default_value='false',
                               description='true: auto_mapper starts exploring as soon as Nav2 is ready'),
         include('ee3033_mission', 'base_sensors.launch.py'),

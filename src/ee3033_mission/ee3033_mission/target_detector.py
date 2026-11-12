@@ -35,6 +35,21 @@ def image_msg_to_bgr(msg):
     raise ValueError(f'unsupported image encoding {msg.encoding}')
 
 
+def limit_ncnn_threads(n):
+    """Ultralytics' NCNN backend leaves ncnn at its default thread count (all 4 cores of the Pi 5): every ncnn Net
+    created from now on uses n threads. On the car with the mission running, NCNN at 640 took ~190 ms per frame with
+    2 threads and ~365 ms with 4 (PyTorch with 2: ~525 ms)."""
+    import ncnn
+    base = ncnn.Net
+
+    class Net(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.opt.num_threads = n
+
+    ncnn.Net = Net
+
+
 class TargetDetector(Node):
 
     def __init__(self):
@@ -64,6 +79,8 @@ class TargetDetector(Node):
         if int(p('num_threads')) > 0:
             import torch
             torch.set_num_threads(int(p('num_threads')))     # leave cores for Nav2 and AMCL
+            if model_path.rstrip('/').endswith('_ncnn_model'):
+                limit_ncnn_threads(int(p('num_threads')))
         self.get_logger().info(f'Loading YOLO model {model_path} (imgsz={self.imgsz})')
         self.model = YOLO(model_path, task='detect')
         names = self.model.names  # {id: name}
@@ -97,6 +114,14 @@ class TargetDetector(Node):
         """
         if os.path.exists(model_path):
             return model_path
+        if model_path.rstrip('/').endswith('_ncnn_model'):     # not exported yet: the PyTorch weights instead
+            pt = model_path.rstrip('/')[:-len('_ncnn_model')] + '.pt'
+            self.get_logger().warn(f'{model_path} not found; using {pt} (PyTorch, ~3x slower). Export once on the car: '
+                                   f'pip install ncnn; cd {os.path.dirname(pt)} && yolo export '
+                                   f'model={os.path.basename(pt)} format=ncnn imgsz={self.imgsz}')
+            model_path = pt
+            if os.path.exists(model_path):
+                return model_path
         folder, name = os.path.split(os.path.abspath(model_path))
         self.get_logger().warn(f'{model_path} not found; downloading {name} (needs internet on the car)')
         try:

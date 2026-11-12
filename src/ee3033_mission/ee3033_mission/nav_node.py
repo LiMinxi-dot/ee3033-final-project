@@ -339,6 +339,58 @@ class NavStateNode(Node):
         turn = float(wrap_angle(math.atan2(via[1] - pose[1], via[0] - pose[0]) - pose[2]))
         return turn if abs(turn) > limit else None
 
+    def _check_leg_line(self, max_replans=3, skip=0.06, slack=0.01):
+        """While a route leg is driven, on every new /map: the straight line from the robot to the leg's waypoint
+        (apart from its first `skip` m) must keep route_clearance - slack from the map walls; if not, plan the route
+        again from here if that is clearer (at most max_replans times per route); without any clear route from here
+        stop the leg (failed: the caller escapes or retries) instead of pushing on into the corner. The legs were planned on an older map from the last
+        waypoint, and walls are drawn as the robot gets near them. Lab maze 1112_104708: when the leg into a 0.35 m
+        passage was planned its corner was 0.14 m off the line, two seconds into the leg the map put it at 0.11 m,
+        the robot drove on, a wheel hit the corner and the robot fell."""
+        r, w = self.route, self.watch
+        if not r or not r['legs'] or self.own_move is not None or tuple(w['xy']) != tuple(r['legs'][0]) or \
+                self.map is None or r['checked'] == self.map_count:
+            return
+        r['checked'] = self.map_count
+        pose = self.robot_pose()
+        if pose is None:
+            return
+        x, y = r['legs'][0]
+        d = math.hypot(x - pose[0], y - pose[1])
+        if d <= skip:
+            return
+        grid, res, origin, sdf = self.map_sdf()
+        need = float(self.cfg['route_clearance'])
+        start = (pose[0] + (x - pose[0]) * skip / d, pose[1] + (y - pose[1]) * skip / d)
+        low = line_min_sdf(sdf, res, origin, start, (x, y))
+        if low >= need - slack:
+            return
+        legs = plan_route(grid, res, origin, pose[:2], r['legs'][-1], clearance=need,
+                          max_leg=float(self.cfg['route_max_leg']))
+        if not legs:                  # no way on from here that keeps clear: stop instead of pushing on into the
+            self.get_logger().warn(f'Leg to ({x:.2f}, {y:.2f}) now passes {low:.2f} m from a wall (map updated) and '
+                                   f'there is no clear route from here: stopping this leg')
+            self._cancel_goal()       # corner (the caller escapes / retries, as after a failed leg)
+            self.stop_robot()
+            self._finish_action(self.action_seq, False)
+            return
+        d0 = math.hypot(legs[0][0] - pose[0], legs[0][1] - pose[1])
+        s0 = (pose[0] + (legs[0][0] - pose[0]) * min(1.0, skip / d0), pose[1] + (legs[0][1] - pose[1]) * min(1.0, skip / d0)) \
+            if d0 > 0 else pose[:2]
+        better = line_min_sdf(sdf, res, origin, s0, legs[0])
+        if better < low + 0.02 or r['replans'] >= max_replans:   # not clearer here (the robot is close to the
+            return                                                # wall already), or re-planned often enough
+        r['replans'] += 1
+        self.get_logger().warn(f'Leg to ({x:.2f}, {y:.2f}) now passes {low:.2f} m from a wall (map updated); route '
+                               f'planned again from here ({better:.2f} m): {len(legs)} legs via '
+                               + ' '.join(f'({a:.2f},{b:.2f})' for a, b in legs))
+        self.action_seq += 1          # the leg's goal ends as aborted (preempted): ignored
+        self.action_done_cb, self.action_deadline, self.watch = None, None, None
+        self._cancel_goal()
+        r['total'] = r['total'] - len(r['legs']) + len(legs)
+        r['legs'] = legs
+        self._next_leg()
+
     def _check_leg_pass(self):
         """Within leg_pass of a route waypoint that is not the last one, send the next leg at once: Nav2 preempts
         the leg's goal and the robot drives on. Waiting for Nav2 to reach each waypoint (slow down, DWB's turn to
@@ -633,7 +685,7 @@ class NavStateNode(Node):
                               max_leg=float(self.cfg['route_max_leg']))
         if not legs:                  # no route on the map: let Nav2 try the whole way
             legs = [(float(x), float(y))]
-        self.route = {'legs': legs, 'yaw': yaw, 'done': on_done, 'total': len(legs)}
+        self.route = {'legs': legs, 'yaw': yaw, 'done': on_done, 'total': len(legs), 'replans': 0, 'checked': -1}
         self.get_logger().info(f'{label}: {len(legs)} legs via ' + ' '.join(f'({a:.2f},{b:.2f})' for a, b in legs))
         self._next_leg()
 
@@ -741,6 +793,8 @@ class NavStateNode(Node):
             self._check_stuck()
         if self.watch is not None and self.action_done_cb is not None:
             self._check_leg_pass()
+        if self.watch is not None and self.action_done_cb is not None:
+            self._check_leg_line()
         if self.action_deadline is not None and time.time() > self.action_deadline:
             self.get_logger().warn('Action timed out; cancelling')
             self._cancel_goal()

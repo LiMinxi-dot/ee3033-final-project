@@ -26,6 +26,7 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction, TimerAction
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -86,7 +87,12 @@ def generate_launch_description():
                               description='odometry left turns x this (odom_scaler); all three 1: off'),
         DeclareLaunchArgument('odom_yaw_scale_cw', default_value='1.0', description='odometry right turns x this'),
         DeclareLaunchArgument('odom_lin_scale', default_value='1.0', description='odometry distances x this'),
+        DeclareLaunchArgument('heading_hold', default_value='false',
+                              description='turn the robot back to its start heading until the exploration / mission '
+                                          'starts (heading_hold; mapping and mission launch: true)'),
         *base,
+        Node(package='ee3033_mission', executable='heading_hold', name='heading_hold', output='screen',
+             condition=IfCondition(LaunchConfiguration('heading_hold'))),
         TimerAction(period=2.0, actions=[LogInfo(msg='[ee3033] starting LiDAR'), lidar]),
         TimerAction(period=4.0, actions=[LogInfo(msg='[ee3033] starting scan resampler'), resampler]),
     ])

@@ -50,6 +50,12 @@ file rewritten (the vendor package stays unchanged):
   next to the inscribed zone that tracing failed ("Failed to create a plan from potential when a legal potential
   was found"): the robot stood 0.11 m from a wall, the map had a wide free way home, and every replan failed for
   40 s, so the return failed. Smac 2D searches the grid instead; cost_travel_multiplier keeps paths off walls.
+  keep_off_walls (launch argument, default true): DWB BaseObstacle.scale 0.05 -> 0.25, PathDist.scale 16 -> 32,
+  GoalDist.scale 24 -> 12, inflation cost_scaling_factor 3 -> 10 (both costmaps). With the vendor values DWB hardly
+  minded the walls and was pulled straight at the leg's goal, and the inflation costs were nearly flat inside the
+  0.20 m radius (0.12 m from a wall 229, 0.17 m 211), so neither DWB nor Smac kept the robot in the middle of a
+  narrow passage. Lab maze 1112_104708: going round the corner into a 0.35 m passage the robot drifted 3-4 cm off
+  the centre, a wheel hit the corner (LiDAR 0.14 m) and it fell. Now 229 / 139: a clear slope across a passage.
   bond_timeout 0 for the lifecycle manager (no bonds): in the site mission it missed controller_server's
   heartbeat for 4 s while YOLO loaded the CPU, shut Nav2 down ("CRITICAL FAILURE ... IS DOWN"), and its
   bringup after the reset never finished, so every goal of the mission was rejected.
@@ -113,14 +119,22 @@ def rewrite(params, overrides, new=()):
         if '.' not in path:
             every(params, path, value)
             continue
-        *parents, leaf = path.split('.')
-        node = params
-        for p in parents:
-            node = node[p]
+        parts, node, i = path.split('.'), params, 0
+        while i < len(parts) - 1 and isinstance(node.get(parts[i]), dict):
+            node, i = node[parts[i]], i + 1
+        leaf = '.'.join(parts[i:])             # DWB critic keys contain a dot themselves: 'BaseObstacle.scale'
         if leaf not in node and path not in new:
             raise KeyError(f'{path} is not in the vendor Nav2 params')
         node[leaf] = value
     return params
+
+
+KEEP_OFF_WALLS = {                        # see keep_off_walls above
+    DWB + 'BaseObstacle.scale': 0.25,
+    DWB + 'PathDist.scale': 32.0,
+    DWB + 'GoalDist.scale': 12.0,
+    'cost_scaling_factor': 10.0,          # both inflation layers
+}
 
 
 def speed_overrides(speed):
@@ -133,6 +147,8 @@ def speed_overrides(speed):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('max_speed', default_value='0.10', description='m/s, DWB and the velocity smoother'),
+        DeclareLaunchArgument('keep_off_walls', default_value='true',
+                              description='DWB and inflation keep the robot off walls (false: vendor values)'),
         OpaqueFunction(function=nav2_actions),
     ])
 
@@ -140,12 +156,13 @@ def generate_launch_description():
 def nav2_actions(context):
     # Our own rewrite instead of nav2_common's RewrittenYaml, which cannot write lists (the smoother limits).
     speed = float(LaunchConfiguration('max_speed').perform(context))
+    walls = KEEP_OFF_WALLS if LaunchConfiguration('keep_off_walls').perform(context).lower() == 'true' else {}
     src = os.path.join(get_package_share_directory('balance_navigation'), 'config', 'nav2_core_params.yaml')
     bt = os.path.join(get_package_share_directory('ee3033_mission'), 'behavior_trees',
                       'navigate_to_pose_no_motion_recoveries.xml')
     added = {'bt_navigator.ros__parameters.default_nav_to_pose_bt_xml': bt}
     with open(src) as f:
-        params = rewrite(yaml.safe_load(f), {**OVERRIDES, **speed_overrides(speed), **added}, new=added)
+        params = rewrite(yaml.safe_load(f), {**OVERRIDES, **walls, **speed_overrides(speed), **added}, new=added)
     with tempfile.NamedTemporaryFile('w', prefix='ee3033_nav2_', suffix='.yaml', delete=False) as f:
         yaml.safe_dump(params, f)
     nav2 = IncludeLaunchDescription(

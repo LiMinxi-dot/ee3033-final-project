@@ -11,7 +11,7 @@ EE3033 Systems Integration and Design Lab, NUS. Group 6.
 | Package | Contents |
 |---|---|
 | [`ee3033_interfaces`](src/ee3033_interfaces) | Messages: `TargetDetection`, `TargetDetectionArray`, `TargetEstimate` |
-| [`ee3033_mission`](src/ee3033_mission) | Nodes `auto_mapper`, `target_detector`, `target_localizer`, `mission_manager`, `odom_scaler`, `cmd_vel_watchdog`; tools `setup_check`, `camera_lidar_check`, `odom_turn_test`; `scripts/demo.sh`; launch files; parameters in `config/mission.yaml`; RViz config |
+| [`ee3033_mission`](src/ee3033_mission) | Nodes `auto_mapper`, `target_detector`, `target_localizer`, `mission_manager`, `odom_scaler`, `heading_hold`, `cmd_vel_watchdog`; tools `setup_check`, `camera_lidar_check`, `odom_turn_test`; `scripts/demo.sh`; launch files; parameters in `config/mission.yaml`; RViz config |
 
 See [`src/ee3033_mission/README.md`](src/ee3033_mission/README.md) for nodes, topics and design details.
 
@@ -75,7 +75,15 @@ ros2 run ee3033_mission setup_check            # every line should be ✔
 ```
 
 The YOLO weights (`/home/ros2_ws/models/yolov8n.pt`, 6.5 MB) are downloaded automatically on the
-first start if the car has internet; otherwise copy `yolov8n.pt` there by hand.
+first start if the car has internet; otherwise copy `yolov8n.pt` there by hand. The detector uses the NCNN export of
+them (about 3x faster than PyTorch on the Pi 5 with the mission running: ~135 vs ~500 ms per frame); export it once:
+
+```bash
+pip install ncnn
+cd /home/ros2_ws/models && yolo export model=yolov8n.pt format=ncnn imgsz=640   # -> yolov8n_ncnn_model/
+```
+
+Without the export the detector falls back to `yolov8n.pt` (with a warning).
 
 On the computer, `ros2 run ee3033_mission setup_check --computer` checks the PC side (clone and
 build the repo there too if you want the RViz config and to echo `/target/estimate`).
@@ -121,16 +129,24 @@ and put the two ratios in `ODOM_ARGS` in `scripts/demo.sh`. Restarted with them
 ### 5. Run the demo
 
 ```bash
-# on the car, inside the container; each step starts by itself (~45 s), THE CAR MOVES
-ros2 run ee3033_mission demo.sh mapping   # car at the start: explore, return, save the map, stop
+# on the car, inside the container; THE CAR MOVES by itself once each step is up
+ros2 run ee3033_mission demo.sh mapping --local   # car at the start: explore, return, save the map, stop
 # place the target
-ros2 run ee3033_mission demo.sh mission   # car at the start: search, report the target, return home
+ros2 run ee3033_mission demo.sh mission --local   # YOLO loads first; then put the car on the start mark and press
+                                                  # Enter: search, report the target, return home
 ros2 run ee3033_mission demo.sh stop      # stop the car and all ROS nodes
 ros2 service call /mission/stop std_srvs/srv/Trigger   # emergency stop from the computer (or /explore/stop)
 
 # watch from the computer
 rviz2 -d $(ros2 pkg prefix ee3033_mission)/share/ee3033_mission/rviz/mission.rviz
 ```
+
+`--local` keeps all ROS traffic on the car (`ROS_LOCALHOST_ONLY=1`): with a poor Wi-Fi link the base and LiDAR
+drivers stalled for up to 3 s and the car fell. The computer then sees nothing (no RViz, no emergency stop from it:
+Ctrl-C on the car or `demo.sh stop`); leave it out to watch in RViz on a good link. The mission starts the camera
+and YOLO before the base driver (loading torch and the model starved the base driver; two missions fell during it).
+While the system comes up, `heading_hold` turns the car back to its start heading (it turns on its own while it
+stands); the mapping step returns to the map origin with heading 0, where the mission starts.
 
 The target position is printed in the `mission_manager` log, published on `/mission/target` and
 written to `/home/ros2_ws/mission_result.yaml`. Each step also saves its log, maps and a bag to
@@ -155,4 +171,9 @@ step again. The manual launch commands are in [`src/ee3033_mission/README.md`](s
 - Both steps ran end-to-end on the site sandbox and in a home arena (Nov 2026). The turn correction and the tuned
   AMCL were checked at home and in replays of site recordings, not yet live on site.
 - People or objects in the arena that are not in the map can pull AMCL away; the viewpoint checks then warn.
-- Below 11 V the motors stop (low-voltage protection): recharge below 11.5 V.
+- Below 11 V the motors stop (low-voltage protection): recharge below 11.5 V. At 11.3-11.5 V the car fell while
+  standing (base data stalled, uncommanded spins); runs at 11.8 V and above were fine. Charge fully for a demo.
+- The camera yaw (`camera_offset_yaw_deg`) must be measured again with `camera_lidar_check` whenever the camera
+  is moved: 3 deg off and the localizer ranged the wall behind the target instead of the target.
+- LiDAR hits on the walls of the saved map are ignored, so a target standing against a wall may get few or no
+  range observations (seen once: one observation for a bottle 5 cm from a wall).

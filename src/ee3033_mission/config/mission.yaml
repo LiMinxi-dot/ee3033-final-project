@@ -4,7 +4,9 @@
 
 target_detector:
   ros__parameters:
-    model_path: /home/ros2_ws/models/yolov8n.pt   # .pt (PyTorch) or *_ncnn_model folder
+    model_path: /home/ros2_ws/models/yolov8n_ncnn_model   # .pt (PyTorch) or *_ncnn_model folder. NCNN (exported on the
+                                   # car: yolo export model=yolov8n.pt format=ncnn imgsz=640; pip ncnn) with the
+                                   # mission running: ~190 ms/frame at 640 vs ~525 ms for the .pt (11-12)
     image_topic: /camera/image_raw
     use_compressed: false          # true when running off-board on /camera/image_raw/compressed
     camera_frame: camera_link      # TF frame of the camera (x forward, y left)
@@ -36,7 +38,8 @@ auto_mapper:
     global_frame: map
     robot_frame: base_footprint
     auto_start: false              # false: start with ros2 service call /explore/start std_srvs/srv/Trigger
-    robot_radius: 0.15             # m; paths keep this far from walls (robot radius 0.12)
+    robot_radius: 0.13             # m; paths keep this far from walls (robot radius 0.12). 0.15 cut off half of the
+                                   # lab maze 1112_083823 behind a 0.35 m passage (0.14 m in the map: walls ~3 cm thick)
     unknown_clearance: 0.20        # m; goals keep this far from unknown space (it may hide a wall the LiDAR missed)
     goal_clearance: 0.15           # m; goals keep this far from walls: a goal at a wall (e.g. for
                                    # (0.20 left frontiers behind 0.4 m passages unexplored in test mazes)
@@ -45,8 +48,18 @@ auto_mapper:
                                    # seen at an angle, 3 cells, and the region behind it stayed unmapped; test mazes:
                                    # 0.15 explores as completely with +4.5 % path, 0.10 +11 %)
     goal_reach: 0.5                # m; the goal is a safe cell at most this far from the frontier
+    small_frontier_size: 0.35      # m; shorter frontiers (cracks, board joints, corners, pocket mouths) are looked at
+    small_goal_clearance: 0.17     # m  from a goal this far from walls and in sight of them, not driven into. Lab
+    small_fallback: false          #    maze 1112_085151: the robot drove into a 0.25 m pocket to 0.11 m from the walls,
+                                   #    SLAM's heading slipped 5-6 deg and the far walls were drawn again rotated.
+                                   #    false: a small frontier in sight of no such goal is skipped; true: any safe
+                                   #    goal in sight (as before; use it if a 0.35 m corridor's end stays unmapped)
     gain_weight: 0.3               # cost = path length - gain_weight * frontier size
     blacklist_radius: 0.3
+    blind_from_deg: 125.0          # LiDAR blind sector (robot frame, CCW from forward, from -> to through 180 deg):
+    blind_to_deg: -175.0           # the robot's body blocks 130..180 deg (every scan of 1112_095156). At a goal with
+                                   # the frontier there, turn to face it first (a frontier 160 deg behind the robot
+                                   # at the start was blacklisted unseen). Both 0 = off
     blacklist_shrink: 0.7          # goal reached but >= this share of its frontier left -> blacklist (a large
                                    # frontier partly resolved stays open; test maze: a 1.45 m frontier was
                                    # blacklisted whole after one look and that corner stayed unmapped)
@@ -68,18 +81,23 @@ auto_mapper:
                                    # (11-06, 11-11). 0 = off
     settle_timeout: 6.0            # max wait for a fresh /map after reaching a goal
     finish_wait: 6.0               # s without any reachable frontier -> exploration done
-    coverage_timeout: 45.0         # s without coverage_step more free area -> exploration done (0 = off). Site 11-06:
+    coverage_timeout: 45.0         # s without coverage_step more free area, a resolved frontier or 0.1 m of route
+                                   # progress -> exploration done
+                                   # (0 = off; lab maze 11-12: it ended the exploration on the way to a small frontier
+                                   # while two were left, each adds < coverage_step). Site 11-06:
                                    # the area was complete after 61-68 s, the rest (40-104 s) only thickened the walls;
                                    # mid-run there were 30-36 s without new area while driving to the far side
     coverage_step: 0.05            # m2 of free area that counts as new (the map at the largest free area is also
                                    # saved, as <map_file>_peak)
     max_duration: 300.0            # s, then return home anyway
     return_home: true
+    home_at_map_origin: 0.3        # m; robot this close to the map origin at the start: home = the origin, heading 0
+                                   # (where it was placed; the mission's initial pose). 0 = the pose at the start
     home_retries: 2
     home_tolerance: 0.25
     home_heading: true             # at home, turn in place (Nav2 spin) to the start heading: the mission's initial pose
     home_yaw_tolerance_deg: 5.0    # turn again while further off (at most 3 turns; odometry over-turns 4-6 %)
-    route_clearance: 0.15          # m; the way home is planned through cells this far from walls/unknown, along
+    route_clearance: 0.13          # m; the way home is planned through cells this far from walls/unknown, along
                                    # corridor centres, and driven in straight legs of at most route_max_leg
     route_max_leg: 0.8
     turn_first_deg: 45.0           # goal direction more than this off the heading: turn in place first (Nav2
@@ -124,7 +142,9 @@ target_localizer:
     # reported the target ~6 cm off (tape against the map walls, notes/2026-11-11-leg-pass.md).
     camera_offset_x: 0.0
     camera_offset_y: 0.015
-    camera_offset_yaw_deg: 3.0
+    camera_offset_yaw_deg: 6.2     # camera_lidar_check 11-12 evening after the camera was tilted forward (screw):
+                                   # 5.7-6.2 deg, 30 samples, bottle at 1.49 m. With 3.0 the localizer's ray missed
+                                   # the bottle and ranged the wall behind it (2.3 / 3.4 m instead of 1.5 m)
     use_camera_info: true
     min_score: 0.5
     min_range: 0.15
@@ -175,8 +195,9 @@ mission_manager:
                                    # cell is within this distance and in line of sight of one of them
                                    # (YOLO must find the target this far away: check on site, see imgsz)
     candidate_spacing: 0.25        # m; grid of candidate viewpoints
-    min_clearance: 0.15            # m from walls/unknown space (0.20 cut off two rooms behind 0.30-0.34 m passages
-                                   # on site map 1105_043031: 61 % seen instead of 96 %; mapping drives at 0.15 too)
+    min_clearance: 0.13            # m from walls/unknown space (0.20 cut off two rooms behind 0.30-0.34 m passages
+                                   # on site map 1105_043031: 61 % seen instead of 96 %; 0.15 on lab map 1112_083823:
+                                   # 64 % instead of 81 %, no route through a 0.35 m passage; mapping uses 0.13 too)
     max_viewpoints: 40
     nav_timeout: 30.0              # s per Nav2 goal (route legs are at most route_max_leg long)
     stuck_time: 8.0                # s; a Nav2 goal during which the robot moves less than stuck_move ends:
@@ -195,7 +216,7 @@ mission_manager:
                                    # Until 11-11 off: DWB's own turn to the goal heading took 9-12 s (site 11-06)
     home_yaw_tolerance_deg: 5.0
     home_retries: 2
-    route_clearance: 0.15          # m; routes to viewpoints and home: straight legs along corridor centres
+    route_clearance: 0.13          # m; routes to viewpoints and home: straight legs along corridor centres
     route_max_leg: 0.8
     turn_first_deg: 45.0           # as auto_mapper
     drive: false                   # as auto_mapper (off); drive_speed comes from mission.launch.py (max_speed)

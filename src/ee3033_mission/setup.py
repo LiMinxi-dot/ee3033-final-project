@@ -35,6 +35,7 @@ setup(
             'camera_lidar_check = ee3033_mission.camera_lidar_check:main',
             'odom_scaler = ee3033_mission.odom_scaler:main',
             'odom_turn_test = ee3033_mission.odom_turn_test:main',
+            'heading_hold = ee3033_mission.heading_hold:main',
         ],
     },
 )

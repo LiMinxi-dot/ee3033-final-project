@@ -15,6 +15,7 @@ It uses the vendor packages on the car (`balance_robot_base`, `lslidar_driver_n1
 | `cmd_vel_watchdog` | `/cmd_vel_teleop` | `/cmd_vel` (speed-limited; stop 0.6 s after the last command) |
 | `auto_mapper` | `/map` (SLAM Toolbox), TF, Nav2 action `navigate_to_pose` | `/explore/state`, `/explore/frontiers`, map files |
 | `odom_scaler` | `/odom_raw` (the base, with `odom_yaw_scale*` != 1) | `/odom`, TF `odom_combined -> base_footprint` with the base's left / right turns scaled |
+| `heading_hold` | `/odom`, `/robot_euler`, `/explore/state`, `/mission/state` | `/cmd_vel` (turn in place back to the start heading until the exploration / mission starts; mapping and mission launch) |
 
 Services: `/mission/start`, `/mission/stop` (`std_srvs/Trigger`), `/target_localizer/reset` (`std_srvs/Empty`),
 `/explore/start`, `/explore/stop`, `/explore/save_map` (`std_srvs/Trigger`).
@@ -33,14 +34,20 @@ Frontier exploration on the live SLAM Toolbox map (`ros2 launch ee3033_mission m
 1. Frontiers: free cells next to unknown cells, grouped into clusters; clusters shorter than `min_frontier_size` are noise.
 2. Traversable space: free cells at least `robot_radius` from occupied cells. A wavefront from the robot gives the
    path length to every reachable cell. A frontier's goal is the reachable cell closest to its centre (within `goal_reach`).
+   A frontier shorter than `small_frontier_size` (0.35 m: a crack, a board joint, a corner, a pocket mouth) is
+   looked at from a goal at least `small_goal_clearance` from walls and in sight of it, not driven into; with no
+   such goal it is skipped (`small_fallback: true`: any safe goal in sight, as before). Lab maze 11-12: in a
+   0.25 m pocket SLAM's heading slipped 5-6 deg and the far walls were drawn again rotated.
 3. Cost = path length − `gain_weight` × frontier size. The robot drives to the cheapest frontier's goal along a
    route, like the way home: straight legs along corridor centres (≥ `route_clearance` from walls and unknown space),
    turning in place at each corner; Nav2 drives each leg. One long Nav2 goal cut the corner of a 0.45 m gap and the
    robot hit the wall. Without a route on the map, Nav2 gets the whole way.
 4. The goal is kept until its frontier disappears (explored on the way), Nav2 fails or progress along the route stops; failed
    frontiers are blacklisted. After reaching a goal the node waits for a fresh map; a frontier that is still there
-   cannot be resolved from there and is blacklisted.
-5. No reachable frontier for `finish_wait` s, no `coverage_step` more free area for `coverage_timeout` s (the area
+   cannot be resolved from there and is blacklisted. A frontier in the LiDAR's blind sector at the goal
+   (`blind_from_deg`..`blind_to_deg`, behind the robot to the left, blocked by its body) is first faced by a turn.
+5. No reachable frontier for `finish_wait` s, no `coverage_step` more free area, no resolved frontier and no route progress for
+   `coverage_timeout` s (the area
    is complete; on site 11-06 it was after 61 s, and the next 104 s in two corners only thickened the walls from
    8.7 to 11.2 cm), or `max_duration` → save the map, drive back to the start pose (same heading, so the mission can
    use the map origin as initial pose). The map after the return goes to `<map_file>_after_return` only: the
@@ -123,6 +130,8 @@ ros2 run ee3033_mission demo.sh mapping   # robot at the start: explore, return,
 # place the target
 ros2 run ee3033_mission demo.sh mission   # robot at the start: search, report, return home
 ros2 run ee3033_mission demo.sh stop      # stop the robot and all ROS nodes (also leftovers of earlier runs)
+# --local after the step (demo.sh mapping --local): ROS traffic stays on the car (ROS_LOCALHOST_ONLY=1); the VM
+#   and RViz see nothing. Big arena 11-12 with poor Wi-Fi: base and LiDAR nodes stalled up to 3 s, two falls.
 ```
 
 Each step first stops ROS nodes left over from earlier runs. Ctrl-C stops the robot and all nodes.
@@ -183,6 +192,9 @@ rviz2 -d $(ros2 pkg prefix ee3033_mission)/share/ee3033_mission/rviz/mission.rvi
 ```
 
 The result is printed in the `mission_manager` log, published on `/mission/target` and written to `/home/ros2_ws/mission_result.yaml`.
+A second line (and `x_cm`, `y_cm` in the YAML) gives it in cm from the mapping start, for checking with a tape:
+x forward, y left of the robot's pose at the start of mapping (midpoint of the wheels), e.g.
+`x = -4.6 cm (behind), y = -71.2 cm (right)`.
 
 ## Build
 

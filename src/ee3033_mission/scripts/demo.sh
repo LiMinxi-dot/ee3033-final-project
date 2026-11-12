@@ -4,9 +4,14 @@
 #   ros2 run ee3033_mission demo.sh mapping   # step 1: robot at the start; explores, returns to the start,
 #                                             #   saves the map, then stops the mapping nodes
 #   (place the target)
-#   ros2 run ee3033_mission demo.sh mission   # step 2: robot at the start; searches, reports, returns home
+#   ros2 run ee3033_mission demo.sh mission   # step 2: YOLO loads first; place the robot on the start mark and
+#                                             #   press Enter: searches, reports, returns home
 #   ros2 run ee3033_mission demo.sh stop      # stop the robot and all ROS nodes
 #   Further arguments go to the launch file, e.g. demo.sh mapping laser_yaw:=0.0 max_speed:=0.10
+#   --local (or DEMO_LOCAL=1): all ROS traffic stays on the car (ROS_LOCALHOST_ONLY=1); the VM sees nothing (no
+#   RViz, no ros2 CLI, no emergency stop from the VM: Ctrl-C here, or demo.sh stop on the car). 11-12, big arena with
+#   poor Wi-Fi: the base and LiDAR nodes stalled for up to 3 s (header stamps too), SLAM dropped scans, two falls.
+#   demo.sh stop (and the cleanup before each step) knows when the nodes were started with --local.
 #   (they override ODOM_ARGS / MISSION_ARGS; fallback to the setup run on site on 11-11 morning, see the README:
 #    demo.sh mapping|mission odom_yaw_scale:=1.0 odom_yaw_scale_cw:=1.0 amcl_tuned:=false)
 #
@@ -16,7 +21,7 @@
 # Full logs: /tmp/ee3033_mapping.log, /tmp/ee3033_mission.log (overwritten by the next run). At the end of each
 # step (also after a failure or Ctrl-C) the log, the map and the result are copied to /home/ros2_ws/logs/<time>_<step>/,
 # where each step also records a bag (mapping: to rerun SLAM offline; mission: falls, localization, speeds).
-# Emergency stop from the VM: ros2 service call /explore/stop (or /mission/stop) std_srvs/srv/Trigger
+# Emergency stop from the VM (not with --local): ros2 service call /explore/stop (or /mission/stop) std_srvs/srv/Trigger
 
 set -u
 MAP=/home/ros2_ws/maps/sandbox
@@ -131,8 +136,16 @@ wait_state() {     # wait_state <log>: sets RESULT to the final state (DONE / FA
 
 case "${1:-}" in
   mapping|mission|stop) STEP=$1;;
-  *) echo "usage: ros2 run ee3033_mission demo.sh mapping|mission|stop"; exit 2;;
+  *) echo "usage: ros2 run ee3033_mission demo.sh mapping|mission|stop [--local] [launch args]"; exit 2;;
 esac
+LOCAL=${DEMO_LOCAL:-0}
+LAUNCH_ARGS=()
+for a in "${@:2}"; do
+  if [ "$a" = --local ]; then LOCAL=1; else LAUNCH_ARGS+=("$a"); fi
+done
+LOCAL_MARK=/tmp/ee3033_demo_local   # exists while the nodes run in local mode
+# nodes left from a local run listen on the loopback only: stop them (zero /cmd_vel, service calls) the same way
+[ -f "$LOCAL_MARK" ] && export ROS_LOCALHOST_ONLY=1
 
 if nodes >/dev/null; then
   say "stopping ROS nodes left from earlier runs:"
@@ -145,13 +158,19 @@ fi
 # `fastdds shm clean` (3 zombie segments) it started. stop_all's kill -KILL leaves such segments (21 after one stop).
 # Only segments no running process uses are removed.
 fastdds shm clean 2>&1 | grep -E "[1-9][0-9]* zombie" | sed 's/^/[demo] /'
-[ "$1" = stop ] && { say "all ROS nodes stopped"; exit 0; }
+[ "$1" = stop ] && { rm -f "$LOCAL_MARK" /tmp/ee3033_go; say "all ROS nodes stopped"; exit 0; }
+if [ "$LOCAL" = 1 ]; then
+  export ROS_LOCALHOST_ONLY=1; touch "$LOCAL_MARK"
+  say "LOCAL MODE: ROS traffic stays on the car (the VM and RViz see nothing; stop with Ctrl-C or demo.sh stop)"
+else
+  export ROS_LOCALHOST_ONLY=0; rm -f "$LOCAL_MARK"
+fi
 
 T0=$(date +%s)
 if [ "$1" = mapping ]; then
   say "STEP 1: auto mapping. The robot starts exploring by itself when Nav2 is ready (~45 s)."
   RUN_LOG=$MAP_LOG
-  start_launch "$MAP_LOG" mapping.launch.py explore:=true auto_start:=true "${ODOM_ARGS[@]}" "${@:2}"
+  start_launch "$MAP_LOG" mapping.launch.py explore:=true auto_start:=true "${ODOM_ARGS[@]}" "${LAUNCH_ARGS[@]}"
   # what SLAM got (~75 kB/s) and the speed commands and plans (11-06: the robot stood still at leg ends, no data why)
   start_bag /scan /scan_fixed /tf /tf_static /odom /robot_euler /map /cmd_vel /cmd_vel_nav /plan
   wait_state "$MAP_LOG"
@@ -171,7 +190,24 @@ fi
 [ -f "$MAP.yaml" ] || { say "no map at $MAP.yaml: run demo.sh mapping first"; exit 1; }
 say "STEP 2: mission on $MAP.yaml. The robot starts searching by itself when Nav2 is ready."
 RUN_LOG=$MISSION_LOG
-start_launch "$MISSION_LOG" mission.launch.py map:="$MAP.yaml" auto_start:=true "${ODOM_ARGS[@]}" "${MISSION_ARGS[@]}" "${@:2}"
+# In a terminal: camera + YOLO load first (mission.launch.py yolo_first), then Enter once the robot is placed
+# starts the base driver (its odometry origin = where the robot stands then), AMCL and the mission.
+GO=/tmp/ee3033_go
+rm -f "$GO"
+WAIT_ARGS=()
+[ -t 0 ] && WAIT_ARGS=(start_file:="$GO")
+start_launch "$MISSION_LOG" mission.launch.py map:="$MAP.yaml" auto_start:=true "${ODOM_ARGS[@]}" "${MISSION_ARGS[@]}" \
+  "${WAIT_ARGS[@]}" "${LAUNCH_ARGS[@]}"
+if [ -t 0 ]; then
+  say "loading YOLO (the base is not started yet: place the robot meanwhile) ..."
+  while kill -0 "$LAUNCH_PID" 2>/dev/null && ! grep -q "YOLO is ready: waiting for $GO" "$MISSION_LOG"; do sleep 0.5; done
+  if kill -0 "$LAUNCH_PID" 2>/dev/null; then
+    say "YOLO is ready. Place the robot on the start mark, facing the start direction, then press Enter to start."
+    read -r _
+    touch "$GO"
+    say "starting the base, AMCL and the mission (the robot starts when Nav2 is ready)"
+  fi
+fi
 # pitch (falls), battery, what AMCL got and the speed commands (11-06: a fall and a lost localization without data)
 start_bag /scan_fixed /tf /tf_static /odom /robot_euler /power_voltage /amcl_pose /cmd_vel /cmd_vel_nav /plan \
   /mission/state /target/estimate

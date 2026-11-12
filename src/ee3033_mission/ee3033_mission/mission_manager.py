@@ -314,11 +314,17 @@ class MissionManager(NavStateNode):
             self.pub_target.publish(pt)
             result = {'found': True, 'confirmed': bool(est.confirmed), 'class': est.class_name,
                       'x': round(x, 3), 'y': round(y, 3), 'observations': int(est.num_observations),
+                      'x_cm': round(100 * x, 1), 'y_cm': round(100 * y, 1),
                       'spread': round(float(est.spread), 3), 'time_s': round(elapsed, 1)}
+            # map origin = the robot at the start of mapping (x forward, y left): for checking with a tape
+            cm_line = (f'TARGET in cm from the mapping start: x = {100 * x:+.1f} cm '
+                       f'({"in front" if x >= 0 else "behind"}), y = {100 * y:+.1f} cm '
+                       f'({"left" if y >= 0 else "right"})')
         else:
             banner = f'TARGET NOT FOUND after {elapsed:.1f}s'
             result = {'found': False, 'time_s': round(elapsed, 1)}
-        lines = [banner]
+            cm_line = None
+        lines = [banner] + ([cm_line] if cm_line else [])
         if self.loc_match is not None:
             frac, where = self.loc_match
             ok = frac >= float(self.cfg['min_scan_match'])
