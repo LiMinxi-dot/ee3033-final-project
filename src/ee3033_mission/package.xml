@@ -4,7 +4,7 @@
   <name>ee3033_mission</name>
   <version>0.1.0</version>
   <description>EE3033 balancing car: mapping and autonomous target search mission (detection, target localization, mission state machine).</description>
-  <maintainer email="LiMinxi-dot@users.noreply.github.com">EE3033 Group 6</maintainer>
+  <maintainer email="LiMinxi-dot@users.noreply.github.com">EE3033 Group 2</maintainer>
   <license>MIT</license>
 
   <exec_depend>rclpy</exec_depend>

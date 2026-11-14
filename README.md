@@ -4,7 +4,7 @@ ROS 2 Humble software for the EE3033 balancing car (Raspberry Pi 5, N10P LiDAR, 
 The car maps an unknown sandbox, then autonomously searches it for a target object, reports
 the target position (x, y) in the map frame and returns to its starting position.
 
-EE3033 Systems Integration and Design Lab, NUS. Group 6.
+EE3033 Systems Integration and Design Lab, NUS. Group 2.
 
 ## Packages
 

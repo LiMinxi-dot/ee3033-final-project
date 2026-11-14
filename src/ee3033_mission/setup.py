@@ -19,7 +19,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='EE3033 Group 6',
+    maintainer='EE3033 Group 2',
     maintainer_email='LiMinxi-dot@users.noreply.github.com',
     description='EE3033 balancing car: autonomous target search and localization mission.',
     license='MIT',

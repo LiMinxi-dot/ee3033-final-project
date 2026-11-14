@@ -4,7 +4,7 @@
   <name>ee3033_interfaces</name>
   <version>0.1.0</version>
   <description>Messages for the EE3033 target search mission (detections and target estimate).</description>
-  <maintainer email="LiMinxi-dot@users.noreply.github.com">EE3033 Group 6</maintainer>
+  <maintainer email="LiMinxi-dot@users.noreply.github.com">EE3033 Group 2</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
